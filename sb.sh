@@ -3465,7 +3465,7 @@ system_maintenance_menu() {
 print_startup_logo() {
   local cols=${COLUMNS:-80} locale=${LC_ALL:-${LANG:-}}
   if [[ ! -t 1 || -n ${NO_COLOR:-} || ( $locale != *UTF-8* && $locale != *utf8* ) || $cols -lt 40 ]]; then
-    printf 'LINONO | singbox VPS 双栈智能管理\\n'; return 0
+    printf '%s\n' 'LINONO | singbox VPS 双栈智能管理'; return 0
   fi
   printf '             \033[38;2;1;168;254m▄\033[38;2;1;166;254;48;2;0;158;254m▀\033[38;2;0;157;254;48;2;6;118;248m▀        \033[0m\n'
   printf '         \033[38;2;2;192;254m▄\033[38;2;0;197;254;48;2;1;169;255m▀\033[38;2;0;176;253;48;2;0;170;254m▀\033[38;2;1;168;253;48;2;1;172;253m▀\033[38;2;1;113;254;48;2;0;111;254m▀\033[38;2;0;101;252m▀ \033[38;2;250;6;15m▄\033[38;2;252;6;14m▄\033[38;2;254;0;9;48;2;251;7;16m▀\033[38;2;254;4;13;48;2;251;10;16m▀\033[38;2;253;11;10;48;2;249;19;16m▀\033[38;2;253;30;15;48;2;250;32;17m▀\033[38;2;253;50;18m▄ \033[0m\n'
@@ -3488,15 +3488,23 @@ MAIN_MENU_ROWS=(
 )
 
 print_main_menu() {
-  local service='未知' nodes=0 ips='' v4='-' v6='-'
+  local service='未知' nodes=0 ips='' v4='-' v6='-' core='?'
   service=$(systemctl is-active sing-box 2>/dev/null || printf '未知')
   if [[ -r $STATE_FILE ]]; then nodes=$(jq -r '.connections | length' "$STATE_FILE" 2>/dev/null || printf '0'); fi
   ips=$(get_cached_public_ips 2>/dev/null || true); v4=${ips%%|*}; v6=${ips#*|}
   [[ -n $v4 ]] || v4='-'; [[ -n $v6 ]] || v6='-'
-  if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
-    printf '\033[1;36m●\033[0m singbox VPS 双栈智能管理 v%s  ' "$SCRIPT_VERSION"
-  else printf '* singbox VPS 双栈智能管理 v%s  ' "$SCRIPT_VERSION"; fi
-  printf '服务 %s  sing-box %s  节点 %s  v4 %s  v6 %s\n' "$service" "$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || printf '?')" "$nodes" "$v4" "$v6"
+  core=$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || printf '?')
+  print_startup_logo
+  local locale=${LC_ALL:-${LANG:-}}
+  if [[ -t 1 && -z ${NO_COLOR:-} && ${COLUMNS:-80} -ge 100 && ( $locale == *UTF-8* || $locale == *utf8* ) ]]; then
+    # The logo is nine terminal rows tall. Overlay the live status block beside it.
+    printf '\033[4A\033[40G\033[38;5;40m●\033[0m %s  sing-box %s  节点 %s\n' "$service" "$core" "$nodes"
+    printf '\033[40G\033[38;5;45mv4 %s\033[0m\n' "$v4"
+    printf '\033[40G\033[38;5;45mv6 %s\033[0m\n' "$v6"
+    printf '\033[1B\r'
+  else
+    printf '● %s  sing-box %s  节点 %s  v4 %s  v6 %s\n' "$service" "$core" "$nodes" "$v4" "$v6"
+  fi
   printf '%s\n' '────────────────────────────────────────────────────────────────────────'
   local row n label desc handler
   for row in "${MAIN_MENU_ROWS[@]}"; do IFS='|' read -r n label desc handler <<< "$row"; printf ' %s  %-14s  %s  ▸\n' "$n" "$label" "$desc"; done
@@ -3592,7 +3600,6 @@ diagnostics_menu() {
 menu() {
   local choice handler row n label desc fn
   MENU_ACTIVE=1; MENU_INTERRUPT_COUNT=0
-  print_startup_logo
   while true; do
     print_main_menu
     if ! read_menu_choice choice '请选择 [1-6, 0 退出]: '; then
