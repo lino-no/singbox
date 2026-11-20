@@ -6,12 +6,10 @@
 一键脚本
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh)
-
 ```
 ```
 curl -fsSL https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh -o sb.sh
 sudo bash sb.sh install
-
 ```
 
 > 项目地址：[github.com/lino-no/singbox](https://github.com/lino-no/singbox)  
