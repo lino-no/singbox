@@ -3,10 +3,7 @@
 [![GitHub repository](https://img.shields.io/badge/GitHub-lino--no%2Fsingbox-181717?logo=github)](https://github.com/lino-no/singbox)
 
 一个面向 Debian / Ubuntu VPS 的 sing-box 安装与运维脚本。通过 SSH 交互菜单或 `sb` 命令管理代理入站、节点记录、订阅文件、Cloudflare 出站与隧道、证书及日常诊断。
-
-> 项目地址：[github.com/lino-no/singbox](https://github.com/lino-no/singbox)  
-> 主脚本：`sb.sh`
-> 一键命令
+一键脚本
 、、、
 bash <(curl -fsSL https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh)
 、、、
@@ -15,6 +12,9 @@ bash
 curl -fsSL https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh -o sb.sh
 sudo bash sb.sh install
 、、、
+
+> 项目地址：[github.com/lino-no/singbox](https://github.com/lino-no/singbox)  
+> 主脚本：`sb.sh`
 ## 功能
 
 ### 代理入站
