@@ -6,7 +6,15 @@
 
 > 项目地址：[github.com/lino-no/singbox](https://github.com/lino-no/singbox)  
 > 主脚本：`sb.sh`
-
+> 一键命令
+、、、
+bash <(curl -fsSL https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh)
+、、、
+、、、
+bash
+curl -fsSL https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh -o sb.sh
+sudo bash sb.sh install
+、、、
 ## 功能
 
 ### 代理入站
