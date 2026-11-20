@@ -1,26 +1,35 @@
 #!/usr/bin/env bash
 # ============================================================================
-# sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本0.0.1
-# Repository : https://github.com/lisiyong0707/singbox
+# sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
+# Repository : https://github.com/lino-no/singbox
 #
 # 功能总览:
 #   VLESS Reality / Reality gRPC / ShadowTLS v3+SS2022 / Shadowsocks 2022 /
-#   Trojan TLS / VLESS TLS / Hysteria2 / TUIC v5 / Cloudflare Tunnel /
-#   Cloudflare WARP 出站 / 订阅系统 (sing-box / Clash Meta / Shadowrocket) /
-#   节点二维码 / 证书管理 (Certbot 自动续期) / 系统诊断 / 测速 / 配置备份回滚
+#   Trojan TLS / VLESS TLS / Hysteria2 / TUIC v5 / AnyTLS / NaiveProxy / Snell /
+#   Cloudflare Tunnel / Cloudflare WARP 出站 / 订阅系统 (sing-box / Clash Meta /
+#   Shadowrocket) / 节点二维码 / 证书管理 (Certbot 自动续期) / 系统诊断 / 测速 /
+#   配置备份回滚
 #
 # 设计原则:
 #   - set -Eeuo pipefail 严格模式, 全程 trap 统一错误处理
 #   - 所有配置写入 (config.json / state.json / 订阅文件) 一律 mktemp + 校验 + install 原子替换
 #   - 所有 jq 变更一律先在候选文件上验证 (sing-box check / jq 语法), 失败绝不覆盖生产文件,
 #     并自动保留最近一次可用配置备份用于一键回滚
-#   - 绝不使用 eval; 所有用户输入统一走 ask_*/valid_* 校验管道, 拒绝把用户输入直接嵌入
-#     shell 命令行或不受控的变量展开中
+#   - 绝不使用 eval; 所有用户输入统一走 ask_*/valid_* 校验管道
 #
-# 终端能力说明 (交互菜单):
-#   OSC 52 复制依赖 SSH 客户端允许剪贴板控制序列；不支持时可选择 p 输出完整链接。
-#   彩色徽标依赖 UTF-8 与 truecolor/24-bit ANSI；NO_COLOR、非终端、窄屏或不支持真彩色时
-#   降级为纯文字品牌。二维码在窄于 60 列时不绘制字符图，仍保存 PNG 文件。
+# 终端能力依赖与降级 (v0.1.0 起的交互层; 不满足时自动降级, 不影响部署功能):
+#   能力                 依赖                              不支持时
+#   ------------------   -------------------------------   --------------------------------
+#   颜色                 stdout 是终端, 且未设 NO_COLOR     不输出任何颜色转义码
+#   Unicode 图标/线条    LANG/LC_ALL 含 UTF-8               ✓✗●▸═ 换成 [OK] [X] * > =; 转圈换 | / - \
+#   真彩色徽标           COLORTERM=truecolor|24bit          256 色量化 -> 16 色 -> 仅 ASCII 字样
+#   四分块字符 ▘▝▖▗▚▞   终端字体包含 Block Elements        TERM=linux/vt* 自动退回半块字符;
+#                                                          也可设 SB_LOGO_HALF=1 强制
+#   一键复制 (OSC 52)    终端允许 OSC 52 写剪贴板           静默无效; 始终可用 p 显示完整链接
+#                        (tmux 需 set-clipboard on / allow-passthrough, 已自动做 tmux/screen 封装)
+#   图片协议 (可选)      iTerm2 / WezTerm / kitty + SB_LOGO_PNG  使用色块版徽标
+#   二维码               终端宽度 >= 60 列且 qrencode 可用   跳过渲染, 提示 PNG 路径
+#   白底主题             SB_THEME=light                     黄色加深、浅灰变深灰
 # ============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -52,7 +61,7 @@ readonly SUB_HTTPD_UNIT="/etc/systemd/system/sing-box-vps-sub.service"
 readonly LOCK_FILE="/run/sing-box-vps.lock"
 readonly LOGROTATE_FILE="/etc/logrotate.d/sing-box-vps"
 
-SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lisiyong0707/singbox/main/sb.sh}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh}"
 
 readonly REALITY_PRESET_DOMAINS=(
   "gateway.icloud.com"
@@ -68,71 +77,70 @@ readonly REALITY_PRESET_DOMAINS=(
 # ---------------------------------------------------------------------------
 # 颜色与日志
 # ---------------------------------------------------------------------------
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; BOLD='\033[1m'; NC='\033[0m'
-if [[ ! -t 1 || -n ${NO_COLOR:-} ]]; then RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''; fi
-if [[ ${SB_THEME:-dark} == light ]]; then YELLOW='\033[0;33m'; fi
+# ---------------------------------------------------------------------------
+# 终端能力探测 / 颜色 / 图标 (自适应降级, 详见文件头部说明)
+# ---------------------------------------------------------------------------
+RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; DIM=''; NC=''
+UI_TTY=0; UI_COLOR=0; UI_UTF8=0; UI_TRUECOLOR=0; UI_256=0; UI_LIGHT=0
+G_OK='[OK]'; G_X='[X]'; G_WARN='!'; G_SKIP='-'; G_DOT='*'; G_OFF='o'; G_ARR='>'
+G_H='-'; G_HH='='; G_STAR='*'; G_ELL='...'; G_INFO='[i]'; G_BAR='|'; G_END='`'
+G_SPIN=('|' '/' '-' '\')
+UI_LC=('' '' '' '' '' '')
 
-run_with_progress() {
-  local label=$1; shift; local show_output=0
-  if [[ ${1:-} == --show-output ]]; then show_output=1; shift; fi
-  local started=$SECONDS rc=0 logtmp pid frame=0 frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' glyph
-  logtmp=$(mktemp "${TMPDIR:-/tmp}/sb-progress.XXXXXX") || return 1
-  if [[ ${LC_ALL:-${LANG:-}} != *UTF-8* && ${LC_ALL:-${LANG:-}} != *utf8* ]]; then frames='|/-\\'; fi
-  "$@" >"$logtmp" 2>&1 & pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    glyph=${frames:$((frame % ${#frames})):1}; printf '\r%s %s ... %ss' "$glyph" "$label" "$((SECONDS-started))"
-    frame=$((frame+1)); sleep 0.2
-  done
-  if wait "$pid"; then rc=0; else rc=$?; fi
-  if (( rc == 0 )); then
-    printf '\r✓ %s (%ss)\n' "$label" "$((SECONDS-started))"
-    cat "$logtmp" >> "$LOG_FILE" 2>/dev/null || true
-    if (( show_output )); then cat "$logtmp"; fi
-  else
-    printf '\r✗ %s (%ss)\n' "$label" "$((SECONDS-started))" >&2
-    tail -n 10 "$logtmp" >&2
-    printf '详细日志: %s\n' "$LOG_FILE" >&2
-    cat "$logtmp" >> "$LOG_FILE" 2>/dev/null || true
+ui_init() {
+  UI_TTY=0; [[ -t 1 ]] && UI_TTY=1
+  UI_COLOR=$UI_TTY
+  if [[ -n ${NO_COLOR:-} || ${TERM:-dumb} == dumb ]]; then UI_COLOR=0; fi
+  local loc=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
+  loc=${loc,,}
+  UI_UTF8=0
+  if [[ $loc == *utf-8* || $loc == *utf8* ]]; then UI_UTF8=1; fi
+  UI_TRUECOLOR=0
+  case ${COLORTERM:-} in truecolor|24bit) UI_TRUECOLOR=1 ;; esac
+  UI_256=0
+  if [[ ${TERM:-} == *256color* ]]; then UI_256=1; fi
+  UI_LIGHT=0
+  if [[ ${SB_THEME:-} == light ]]; then UI_LIGHT=1; fi
+
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; DIM=''; NC=''
+  UI_LC=('' '' '' '' '' '')
+  if (( UI_COLOR )); then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'; MAGENTA=$'\033[0;35m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+    if (( UI_LIGHT )); then
+      YELLOW=$'\033[0;33m'                       # 白底: 黄色加深
+      if (( UI_256 )); then DIM=$'\033[38;5;240m'; else DIM=$'\033[0;90m'; fi   # 浅灰 -> 深灰
+    else
+      YELLOW=$'\033[1;33m'
+      if (( UI_256 )); then DIM=$'\033[38;5;245m'; else DIM=$'\033[0;90m'; fi
+    fi
+    # LINONO 六个字母: 绿 青 蓝 紫 黄 红 (白底用加深版)
+    local -a rgb c256 c16=(32 36 34 35 33 31) i
+    if (( UI_LIGHT )); then
+      rgb=("46;139;73" "11;122;144" "47;102;201" "142;68;173" "154;116;0" "179;38;30")
+      c256=(29 30 26 97 100 124)
+    else
+      rgb=("78;195;107" "79;195;217" "91;156;245" "198;120;221" "230;195;74" "229;83;75")
+      c256=(71 74 75 176 179 167)
+    fi
+    for i in 0 1 2 3 4 5; do
+      if (( UI_TRUECOLOR )); then UI_LC[i]=$'\033[38;2;'"${rgb[i]}"'m'
+      elif (( UI_256 )); then UI_LC[i]=$'\033[38;5;'"${c256[i]}"'m'
+      else UI_LC[i]=$'\033[0;'"${c16[i]}"'m'; fi
+    done
   fi
-  rm -f "$logtmp"
-  return "$rc"
+  if (( UI_UTF8 )); then
+    G_OK='✓'; G_X='✗'; G_WARN='!'; G_SKIP='–'; G_DOT='●'; G_OFF='○'; G_ARR='▸'
+    G_H='─'; G_HH='═'; G_STAR='★'; G_ELL='…'; G_INFO='›'; G_BAR='│'; G_END='└'
+    G_SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  else
+    G_OK='[OK]'; G_X='[X]'; G_WARN='!'; G_SKIP='-'; G_DOT='*'; G_OFF='o'; G_ARR='>'
+    G_H='-'; G_HH='='; G_STAR='*'; G_ELL='...'; G_INFO='[i]'; G_BAR='|'; G_END='`'
+    G_SPIN=('|' '/' '-' '\')
+  fi
+  return 0
 }
-
-# 计算字符串显示宽度 (按 Unicode 东亚宽度标准: 全角/宽字符算 2, 其余算 1), 用于菜单列对齐
-# 比手工判断字符范围更准确, 能正确处理中英文混排的情况
-# 自动按列计算最大显示宽度并对齐打印, 不需要再手动指定固定宽度数字
-# 用法: _print_menu_cols <每行列数> "第1项" "第2项" "第3项" ...
-_print_menu_cols() {
-  local ncols=$1; shift
-  python3 -c "
-import sys, unicodedata
-
-def width(s):
-    w = 0
-    for ch in s:
-        ea = unicodedata.east_asian_width(ch)
-        w += 2 if ea in ('W', 'F') else 1
-    return w
-
-ncols = int(sys.argv[1])
-items = sys.argv[2:]
-
-# 按列位置分组, 分别算每一列里最宽的那一项 (而不是全部项统一一个宽度)
-col_max = [0] * ncols
-for i, it in enumerate(items):
-    c = i % ncols
-    col_max[c] = max(col_max[c], width(it))
-
-gap = 2  # 列与列之间额外留的间距
-for i, it in enumerate(items):
-    c = i % ncols
-    pad = col_max[c] - width(it) + gap
-    sys.stdout.write(it + ' ' * pad)
-    if c == ncols - 1 or i == len(items) - 1:
-        sys.stdout.write('\n')
-" "$ncols" "$@"
-}
+ui_init
 
 _log_raw() {
   # 日志文件不含颜色转义, 便于后续 grep/诊断
@@ -140,56 +148,52 @@ _log_raw() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-DIAG_ACTIVE=0 DIAG_PASS=0 DIAG_WARN=0 DIAG_FAIL=0 DIAG_SKIP=0
-info() { printf "${BLUE}[i]${NC} %s\n" "$*"; _log_raw "[INFO] $*"; }
-diag_skip() { if (( DIAG_ACTIVE )); then ((DIAG_SKIP+=1)) || true; printf '– %s (跳过)\n' "$*"; else info "$* (跳过)"; fi; }
-ok()   { if (( DIAG_ACTIVE )); then ((DIAG_PASS+=1)) || true; printf '✓ %s\n' "$*"; else printf "${GREEN}[+]${NC} %s\n" "$*"; fi; _log_raw "[OK] $*"; }
-warn() { if (( DIAG_ACTIVE )); then ((DIAG_WARN+=1)) || true; printf '! %s\n' "$*" >&2; else printf "${YELLOW}[!]${NC} %s\n" "$*" >&2; fi; _log_raw "[WARN] $*"; }
-die()  { (( DIAG_ACTIVE )) && ((DIAG_FAIL+=1)) || true; printf "${RED}[x]${NC} %s\n" "$*" >&2; _log_raw "[FATAL] $*"; exit 1; }
-title(){ printf "\n${BOLD}${CYAN}== %s ==${NC}\n" "$*"; }
+info() { printf '%s%s%s %s\n' "$BLUE" "$G_INFO" "$NC" "$*"; _log_raw "[INFO] $*"; }
+ok()   { printf '%s%s%s %s\n' "$GREEN" "$G_OK" "$NC" "$*"; _log_raw "[OK] $*"; }
+warn() { printf '%s%s%s %s\n' "$YELLOW" "$G_WARN" "$NC" "$*" >&2; _log_raw "[WARN] $*"; }
+die()  { printf '%s%s%s %s\n' "$RED" "$G_X" "$NC" "$*" >&2; _log_raw "[FATAL] $*"; exit 1; }
+title(){ printf '\n%s%s%s %s %s%s%s\n' "${BOLD}${CYAN}" "$G_H" "$G_H" "$*" "$G_H" "$G_H" "$NC"; }
 
 on_error() {
   local exit_code=$? line=$1
   local func="${FUNCNAME[1]:-主流程}"
-  printf "${RED}[x]${NC} 运行失败: 函数 [%s] 第 %s 行退出 (状态码 %s)\n" "$func" "$line" "$exit_code" >&2
-  printf "${RED}[x]${NC} 出错命令: %s\n" "${BASH_COMMAND:-未知}" >&2
+  # read 因 Ctrl+D / EOF 失败: 视为用户取消输入, 不当作脚本错误
+  if [[ ${BASH_COMMAND:-} == read\ * ]]; then
+    printf '\n' >&2
+    warn "输入已取消。" || true
+    exit 130
+  fi
+  printf '%s%s%s 运行失败: 函数 [%s] 第 %s 行退出 (状态码 %s)\n' "$RED" "$G_X" "$NC" "$func" "$line" "$exit_code" >&2
+  printf '%s%s%s 出错命令: %s\n' "$RED" "$G_X" "$NC" "${BASH_COMMAND:-未知}" >&2
   if (( ${#FUNCNAME[@]} > 2 )); then
     local i trace=""
     for ((i=1; i<${#FUNCNAME[@]}-1; i++)); do
       trace+="${FUNCNAME[$i]}"
-      (( i < ${#FUNCNAME[@]}-2 )) && trace+=" <- "
+      if (( i < ${#FUNCNAME[@]}-2 )); then trace+=" <- "; fi
     done
-    printf "${RED}[x]${NC} 调用链: %s\n" "$trace" >&2
+    printf '%s%s%s 调用链: %s\n' "$RED" "$G_X" "$NC" "$trace" >&2
   fi
-  printf "${RED}[x]${NC} 日志文件: %s\n" "$LOG_FILE" >&2
+  printf '%s%s%s 日志文件: %s\n' "$RED" "$G_X" "$NC" "$LOG_FILE" >&2
   _log_raw "[FATAL] func=${func} line=${line} exit=${exit_code} cmd=${BASH_COMMAND:-unknown}"
   exit "$exit_code"
 }
 trap 'on_error $LINENO' ERR
 # ---- 中断提示: 部署进行中被打断时, 告诉用户去跑 reconcile ----
 PENDING_TAG=""
-MENU_ACTIVE=0 MENU_ACTION_ACTIVE=0 MENU_INTERRUPT_COUNT=0
 
 on_interrupt() {
   local sig=$1 code=130
+  trap - INT TERM HUP
   case $sig in
     TERM) code=143 ;;
     HUP)  code=129 ;;
   esac
   if [[ -n $PENDING_TAG ]]; then
     warn "收到 ${sig}: 节点 [${PENDING_TAG}] 可能已写入并生效, 但连接记录/防火墙可能未完成。请运行: sb reconcile" || true
-    exit "$code"
-  elif (( MENU_ACTION_ACTIVE )); then
-    warn "操作已中断；返回菜单。" || true
-    exit "$code"
-  elif (( MENU_ACTIVE )); then
-    ((MENU_INTERRUPT_COUNT+=1))
-    if (( MENU_INTERRUPT_COUNT == 1 )); then warn "再按一次 Ctrl+C 或输入 0 退出。" || true; return 0; fi
-    exit "$code"
   else
     warn "已中断 (${sig})。" || true
-    exit "$code"
   fi
+  exit "$code"
 }
 trap 'on_interrupt INT'  INT
 trap 'on_interrupt TERM' TERM
@@ -241,16 +245,16 @@ EOF
 # ---------------------------------------------------------------------------
 confirm() {
   local prompt=$1 default=${2:-N} answer
-  IFS= read -r -e -p "$prompt [$([[ $default == Y ]] && printf 'Y/n' || printf 'y/N')]: " answer || true
+  read -e -r -p "$prompt [$([[ $default == Y ]] && printf 'Y/n' || printf 'y/N')]: " answer || true
   answer=${answer:-$default}
   [[ $answer =~ ^[Yy]$ ]]
 }
 
 ask_required() {
-  local prompt=$1 value
+  local prompt=$1 default=${2:-} value
   while true; do
-    IFS= read -r -e -p "$prompt: " value || true
-    [[ -n $value ]] && { printf '%s' "$value"; return 0; }
+    read -e -r -i "$default" -p "$prompt: " value || die "输入已取消。"
+    if [[ -n $value ]]; then printf '%s' "$value"; return 0; fi
     warn "此项不能为空。"
   done
 }
@@ -267,9 +271,9 @@ valid_port() {
 ask_port() {
   local prompt=$1 default=$2 value
   while true; do
-    IFS= read -r -e -i "$default" -p "$prompt: " value || true
+    read -e -r -i "$default" -p "$prompt: " value || die "输入已取消。"
     value=${value:-$default}
-    valid_port "$value" && { printf '%s' "$((10#$value))"; return 0; }
+    if valid_port "$value"; then printf '%s' "$((10#$value))"; return 0; fi
     warn "端口必须是 1 到 65535 之间的整数。"
   done
 }
@@ -281,13 +285,8 @@ valid_hostname() {
 ask_hostname() {
   local prompt=$1 default=${2:-} value
   while true; do
-    if [[ -n $default ]]; then
-      IFS= read -r -e -p "$prompt [$default]: " value || true
-      value=${value:-$default}
-    else
-      IFS= read -r -e -p "$prompt: " value || true
-    fi
-    valid_hostname "$value" && { printf '%s' "$value"; return 0; }
+    read -e -r -i "$default" -p "$prompt: " value || die "输入已取消。"
+    if valid_hostname "$value"; then printf '%s' "$value"; return 0; fi
     warn "域名格式不正确, 请重新输入。"
   done
 }
@@ -436,21 +435,8 @@ readonly IP_CACHE_FILE="${STATE_DIR}/ip_cache"
 
 # 缓存公网 IPv4/IPv6, 300 秒内复用, 避免菜单每次重绘都发起网络请求
 get_cached_public_ips() {
-  local now cached_time v4 v6
-  now=$(date +%s)
-  if [[ -f $IP_CACHE_FILE ]]; then
-    cached_time=$(sed -n '1p' "$IP_CACHE_FILE" 2>/dev/null)
-    if [[ $cached_time =~ ^[0-9]+$ ]] && (( now - cached_time < 300 )); then
-      v4=$(sed -n '2p' "$IP_CACHE_FILE")
-      v6=$(sed -n '3p' "$IP_CACHE_FILE")
-      printf '%s|%s' "$v4" "$v6"
-      return 0
-    fi
-  fi
-  v4=$(detect_public_ip || true)
-  v6=$(detect_public_ipv6 || true)
-  { printf '%s\n%s\n%s\n' "$now" "$v4" "$v6"; } > "$IP_CACHE_FILE" 2>/dev/null || true
-  printf '%s|%s' "$v4" "$v6"
+  net_snapshot
+  printf '%s|%s' "$NET_V4" "$NET_V6"
 }
 
 format_host_uri() {
@@ -597,7 +583,7 @@ ask_node_network_mode() {
   printf "  1) Dual 双栈节点 (监听 ::, 出站优先 IPv6 并自动回退 IPv4)\n" >&2
   printf "  2) IPv4 专用节点 (监听 0.0.0.0, 出站强制仅使用 IPv4)\n" >&2
   printf "  3) IPv6 严格节点 (监听 ::, 出站强制仅使用 IPv6, 不回退 IPv4)\n" >&2
-  IFS= read -r -e -p "请选择 [1]: " choice
+  read -e -r -i 1 -p "请选择: " choice || die "输入已取消。"
   choice=${choice:-1}
   case "$choice" in
     2)
@@ -616,21 +602,18 @@ ask_node_server() {
   case "$mode" in
     v4)
       default=$(detect_public_ip)
-      IFS= read -r -e -i "$default" -p '客户端连接 IPv4 地址: ' val
-      val=${val:-$default}
+      read -e -r -i "$default" -p "客户端连接 IPv4 地址: " val || die "输入已取消。"
       valid_ipv4 "$val" || valid_hostname "$val" || die "必须填写有效的 IPv4 地址或域名。"
       ;;
     v6)
       default=$(detect_public_ipv6)
-      IFS= read -r -e -i "$default" -p '客户端连接 IPv6 地址: ' val
-      val=${val:-$default}
+      read -e -r -i "$default" -p "客户端连接 IPv6 地址: " val || die "输入已取消。"
       valid_ipv6 "$val" || valid_hostname "$val" || die "必须填写有效的 IPv6 地址或域名。"
       ;;
     *)
       default=$(detect_public_ip)
       [[ -z $default ]] && default=$(detect_public_ipv6)
-      IFS= read -r -e -i "$default" -p '客户端连接双栈地址 (推荐 A/AAAA 域名): ' val
-      val=${val:-$default}
+      read -e -r -i "$default" -p "客户端连接双栈地址 (推荐填已解析 A 和 AAAA 的域名): " val || die "输入已取消。"
       [[ -n $val ]] || die "必须填写有效的连接域名或 IP。"
       ;;
   esac
@@ -656,18 +639,21 @@ mode_outbound_tag() {
 # ---------------------------------------------------------------------------
 # 安装与基础路由配置
 # ---------------------------------------------------------------------------
-install_prerequisites() {
+_install_prerequisites_raw() {
   require_apt
   export DEBIAN_FRONTEND=noninteractive
-  run_with_progress "更新 APT 索引" apt-get update -qq
-  run_with_progress "安装基础依赖" apt-get install -y -qq ca-certificates curl jq openssl iproute2 gnupg qrencode dnsutils python3
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl jq openssl iproute2 gnupg qrencode dnsutils python3 >/dev/null
+}
+install_prerequisites() {
+  ui_run "安装依赖包 (apt)" _install_prerequisites_raw
 }
 
 install_sing_box() {
   require_root; require_systemd; install_prerequisites
   info "配置 sing-box 官方 APT 软件源"
   install -d -m 755 /etc/apt/keyrings
-  run_with_progress "下载 sing-box APT 密钥" curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
+  ui_run "获取 sing-box 软件源密钥" curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
   chmod a+r /etc/apt/keyrings/sagernet.asc
   tee /etc/apt/sources.list.d/sagernet.sources >/dev/null <<'EOF'
 Types: deb
@@ -677,8 +663,7 @@ Components: *
 Enabled: yes
 Signed-By: /etc/apt/keyrings/sagernet.asc
 EOF
-  run_with_progress "更新 sing-box APT 索引" apt-get update -qq
-  run_with_progress "安装 sing-box" apt-get install -y -qq sing-box
+  ui_run "安装 sing-box (apt)" _apt_update_install sing-box
   ensure_base_routing
   systemctl enable sing-box >/dev/null 2>&1 || true
   install_manager
@@ -838,14 +823,6 @@ ensure_port_available() {
   if command -v ss >/dev/null 2>&1 && ss -tulnH "sport = :$port" 2>/dev/null | grep -q .; then
     die "端口 $port 已被宿主机其他进程占用, 请更换端口。"
   fi
-}
-
-quick_reality_port() {
-  local candidate
-  for candidate in 443 8443 2053 2083 2087 2096 4433; do
-    if ! port_is_used_in_config "$candidate" && { ! command -v ss >/dev/null 2>&1 || ! ss -tulnH "sport = :$candidate" 2>/dev/null | grep -q .; }; then printf '%s' "$candidate"; return 0; fi
-  done
-  return 1
 }
 
 check_and_handle_existing_tag() {
@@ -1015,9 +992,8 @@ generate_reality_keypair() {
 # 询问节点显示名称, 返回 URL 编码后的结果 (可直接拼进 URI 的 # 后面)
 ask_node_name() {
   local default=$1 name
-  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '%s' "${QUICK_NAME:-$default}" | jq -sRr '@uri'; return 0; fi
   while true; do
-    IFS= read -r -e -i "$default" -p '节点名称: ' name || true
+    read -e -r -i "$default" -p "节点名称: " name || die "输入已取消。"
     name=${name:-$default}
     if (( ${#name} <= 64 )); then
       printf '%s' "$name" | jq -sRr '@uri'
@@ -1029,17 +1005,12 @@ ask_node_name() {
 # Reality 握手域名: 内置推荐列表 + 自定义, 并做连通性/TLS1.3 粗校验
 ask_reality_handshake_domain() {
   local i choice domain
-  if [[ ${QUICK_MODE:-0} == 1 ]]; then
-    domain=${QUICK_DOMAIN:-${REALITY_PRESET_DOMAINS[0]}}
-    if timeout 4 openssl s_client -connect "${domain}:443" -tls1_3 -servername "$domain" </dev/null >/dev/null 2>&1; then printf '%s' "$domain"; return 0; fi
-    die "默认 Reality 握手域名 ${domain} 未通过 TLS 1.3 探测；请改用自定义 Reality 部署。"
-  fi
   printf "\n选择 Reality 握手伪装域名 (需支持 TLS 1.3, 建议选用大型 CDN/云厂商域名):\n" >&2
   for i in "${!REALITY_PRESET_DOMAINS[@]}"; do
     printf "  %d) %s\n" "$((i+1))" "${REALITY_PRESET_DOMAINS[$i]}" >&2
   done
   printf "  0) 自定义输入\n" >&2
-  IFS= read -r -e -p "请选择 [1]: " choice
+  read -e -r -i 1 -p "请选择: " choice || die "输入已取消。"
   choice=${choice:-1}
   if [[ $choice == 0 ]]; then
     domain=$(ask_required "请输入握手域名")
@@ -1076,7 +1047,7 @@ check_port_80() {
 
 grant_cert_access() {
   id sing-box >/dev/null 2>&1 || return 0
-  command -v setfacl >/dev/null 2>&1 || run_with_progress "安装 ACL 工具" apt-get install -y -qq acl
+  command -v setfacl >/dev/null 2>&1 || apt-get install -y -qq acl
   setfacl -R -m u:sing-box:rX /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
   return 0
 }
@@ -1102,16 +1073,14 @@ obtain_tls_paths() {
     return 0
   fi
   printf "\nTLS 证书获取方式:\n  1) 使用 Certbot 自动签发 Let's Encrypt (需域名解析到本机且 80 端口开放)\n  2) 使用已有 PEM 证书路径\n" >&2
-  IFS= read -r -e -p '选择 [1]: ' choice
+  read -e -r -i 1 -p '选择: ' choice
   choice=${choice:-1}
   case $choice in
     1)
       check_port_80
-      run_with_progress "更新 APT 索引" apt-get update -qq
-      run_with_progress "安装 Certbot" apt-get install -y -qq certbot
+      ui_run "安装 certbot (apt)" _apt_update_install certbot
       open_firewall_port 80 tcp >&2
-      info "正在签发 ${domain} 证书..." >&2
-      run_with_progress "签发 ${domain} 证书" certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$domain"
+      ui_run "签发 ${domain} 证书 (certbot)" certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$domain"
       install_certbot_hook
       grant_cert_access >&2
       enable_certbot_autorenew >&2
@@ -1170,7 +1139,7 @@ renew_certificate_now() {
   valid_hostname "$domain" || die "域名格式不正确。"
   check_port_80
   open_firewall_port 80 tcp
-  run_with_progress "续签 ${domain} 证书" certbot certonly --standalone --non-interactive --agree-tos --force-renewal \
+  certbot certonly --standalone --non-interactive --agree-tos --force-renewal \
     --register-unsafely-without-email -d "$domain"
   install_certbot_hook
   grant_cert_access
@@ -1186,7 +1155,7 @@ cert_management_menu() {
     printf '  2) 立即续期 / 重新申请证书\n'
     printf '  3) 启用/检查 Certbot 自动续期\n'
     printf '  0) 返回主菜单\n'
-    IFS= read -r -e -p '请选择: ' choice
+    read -e -r -p '请选择: ' choice
     case $choice in
       1) show_certificate_expiry ;;
       2) renew_certificate_now ;;
@@ -1210,59 +1179,7 @@ save_connection() {
 # ---------------------------------------------------------------------------
 # 二维码输出
 # ---------------------------------------------------------------------------
-osc52_copy() {
-  local data=$1 b64
-  b64=$(printf '%s' "$data" | base64 | tr -d '\r\n')
-  if [[ -n ${TMUX:-} ]]; then printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64"
-  elif [[ -n ${STY:-} ]]; then printf '\033P\033]52;c;%s\a\033\\' "$b64"
-  else printf '\033]52;c;%s\a' "$b64"; fi
-}
 
-print_uri_preview() {
-  local uri=$1 cols=${COLUMNS:-80} limit
-  if (( cols < 60 )); then limit=48; elif (( cols < 100 )); then limit=76; else limit=120; fi
-  if (( ${#uri} > limit )); then printf '%s… [已截断；选 p 查看完整链接]\n' "${uri:0:limit}"; else printf '%s\n' "$uri"; fi
-}
-
-show_qrcode() {
-  local uri=$1 tag=${2:-node}
-  if ! command -v qrencode >/dev/null 2>&1; then
-    apt-get install -y -qq qrencode >/dev/null 2>&1 || true
-  fi
-  if command -v qrencode >/dev/null 2>&1; then
-    printf '\n'
-    local cols=${COLUMNS:-80}
-    if (( cols >= 60 )); then
-      qrencode -t ANSIUTF8 -m 1 <<<"$uri"
-    else
-      info "窄终端跳过二维码字符渲染。"
-    fi
-    qrencode -t PNG -o "${QR_CACHE_DIR}/${tag}.png" -m 1 <<<"$uri" 2>/dev/null || true
-    (( cols < 60 )) && info "二维码 PNG: ${QR_CACHE_DIR}/${tag}.png"
-  else
-    warn "qrencode 未安装, 已跳过二维码渲染。"
-  fi
-}
-
-print_result_block() {
-  local title=$1 uri=$2 tag=$3
-  PENDING_TAG=""
-  printf '\n%s 客户端连接串:\n' "$title"
-  print_uri_preview "$uri"
-  local action=''
-  IFS= read -r -e -p '操作: [回车]继续 / c复制 / p完整链接 / q二维码: ' action || true
-  case $action in
-    c) osc52_copy "$uri"; info "已发送 OSC 52 复制请求；若终端不支持，请选 p 显示完整链接。" ;;
-    p) printf '%s\n' "$uri" ;;
-    q) show_qrcode "$uri" "$tag" ;;
-  esac
-  show_qrcode "$uri" "$tag"
-  printf '\n'
-  info "正在自动刷新订阅文件..."
-  sub_build_all || warn "订阅文件自动刷新失败, 可稍后运行 'sb sub' 手动刷新。"
-  printf '\n'
-  IFS= read -r -e -p "按回车键继续 (可先复制/截图上面的连接串或二维码)..." _ || true
-}
 
 # ---------------------------------------------------------------------------
 # 通用: 依据网络模式准备端口/监听/出站/tag 的前置流程
@@ -1285,18 +1202,11 @@ deploy_prepare_common() {
   fi
   D_LISTEN=$(mode_listen_addr "$D_MODE")
   D_OUTBOUND=$(mode_outbound_tag "$D_MODE")
-  if [[ ${QUICK_MODE:-0} == 1 ]]; then
-    D_PORT=${QUICK_PORT:-$(quick_reality_port)} || die "未找到可用的快速部署端口。"
-  else D_PORT=$(ask_port "$port_label" "$default_port"); fi
+  D_PORT=$(ask_port "$port_label" "$default_port")
   D_TAG="${tag_prefix}-${D_MODE}-${D_PORT}"
   check_and_handle_existing_tag "$D_TAG" || return 1
   ensure_port_available "$D_PORT"
-  if [[ ${QUICK_MODE:-0} == 1 ]]; then
-    local cached_ips
-    cached_ips=$(get_cached_public_ips); D_HOST=${QUICK_HOST:-${cached_ips%%|*}}
-    [[ -n $D_HOST ]] || D_HOST=$(detect_public_ipv6)
-    [[ -n $D_HOST ]] || die "无法自动探测公网连接地址。"
-  else D_HOST=$(ask_node_server "$D_MODE"); fi
+  D_HOST=$(ask_node_server "$D_MODE")
   D_FORMATTED_HOST=$(format_host_uri "$D_HOST")
   return 0
 }
@@ -1322,19 +1232,15 @@ deploy_prepare_tls_domain() {
 
 deploy_vless_reality_unified() {
   local mode=${1:-}
-  local step_started=$SECONDS
   ensure_installed
   deploy_prepare_common "VLESS Reality 监听端口" 443 "reality" "$mode" || return 0
-  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '✓ 环境、端口与地址准备 (%ss)\n' "$((SECONDS-step_started))"; fi
 
   local handshake keypair private_key public_key short_id uuid reality tls inbound uri flag
-  step_started=$SECONDS
   handshake=$(ask_reality_handshake_domain)
   keypair=$(generate_reality_keypair)
   private_key=${keypair%%|*}; public_key=${keypair#*|}
   short_id=$(openssl rand -hex 4)
   uuid=$(new_uuid)
-  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '✓ 握手域名检查与凭据生成 (%ss)\n' "$((SECONDS-step_started))"; fi
 
   reality=$(jq -n --arg handshake "$handshake" --arg private_key "$private_key" --arg short_id "$short_id" \
     '{enabled:true,handshake:{server:$handshake,server_port:443},private_key:$private_key,short_id:[$short_id]}')
@@ -1343,14 +1249,10 @@ deploy_vless_reality_unified() {
     '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",uuid:$uuid,flow:"xtls-rprx-vision"}],tls:$tls}')
   local node_name; node_name=$(ask_node_name "Reality-${D_MODE}")
   flag=$(get_server_flag)
-  step_started=$SECONDS
   apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"  
-  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '✓ 配置校验、备份与写入 (%ss)\n' "$((SECONDS-step_started))"; fi
   uri="vless://${uuid}@${D_FORMATTED_HOST}:${D_PORT}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=${handshake}&fp=chrome&pbk=${public_key}&sid=${short_id}#${flag}%20${node_name}"
-  step_started=$SECONDS
   save_connection "vless-reality-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
   open_firewall_port "$D_PORT" tcp
-  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '✓ 连接记录与防火墙 (%ss)\n' "$((SECONDS-step_started))"; fi
   ok "VLESS Reality (${D_MODE}) 已成功部署 (绑定出口: ${D_OUTBOUND})"
   print_result_block "VLESS Reality" "$uri" "$D_TAG"
 }
@@ -1559,7 +1461,7 @@ require_sb_feature_version() {
 ask_snell_version() {
   local choice
   printf '\n选择 Snell 协议版本:\n  1) v6 (推荐)\n  2) v5 (兼容旧客户端)\n' >&2
-  IFS= read -r -e -p '请选择 [1]: ' choice
+  read -e -r -i 1 -p '请选择: ' choice
   choice=${choice:-1}
   [[ $choice == 2 ]] && printf '5' || printf '6'
 }
@@ -1623,7 +1525,7 @@ install_cloudflared() {
 
   if [[ -n "$bin_url" ]]; then
     tmp_bin=$(mktemp)
-    if curl -fsSL --retry 3 --connect-timeout 15 "$bin_url" -o "$tmp_bin" 2>/dev/null; then
+    if UI_SOFT=1 ui_run "下载 cloudflared" curl -fsSL --retry 3 --connect-timeout 15 "$bin_url" -o "$tmp_bin"; then
       install -m 755 "$tmp_bin" /usr/local/bin/cloudflared
       rm -f "$tmp_bin"
       info "cloudflared 二进制安装成功: $(cloudflared --version)"
@@ -1666,8 +1568,7 @@ install_cloudflared() {
 deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main
 EOF
 
-  run_with_progress "更新 cloudflared APT 索引" apt-get update -qq
-  run_with_progress "安装 cloudflared" apt-get install -y -qq cloudflared
+  ui_run "安装 cloudflared (apt)" _apt_update_install cloudflared
   install -d -m 700 "$CF_CONFIG_DIR" "$CF_CRED_DIR"
 }
 
@@ -1696,7 +1597,7 @@ deploy_cloudflare_tunnel() {
   printf "\nTunnel 接入方式:\n" >&2
   printf "  1) 已在 Zero Trust 后台创建 Tunnel 并拿到 Token (推荐, 快速接入)\n" >&2
   printf "  2) 使用 cloudflared tunnel create 在本机新建 Tunnel (需已 cloudflared login)\n" >&2
-  IFS= read -r -e -p "请选择 [1]: " use_token
+  read -e -r -i 1 -p "请选择: " use_token
   use_token=${use_token:-1}
 
     if [[ $use_token == 1 ]]; then
@@ -1705,7 +1606,7 @@ deploy_cloudflare_tunnel() {
     printf ' 2. 创建 Tunnel (Cloudflared 类型), 复制安装命令里 "install" 后面那串 Token\n'
     printf ' 3. 该 Tunnel 的 Public Hostname 稍后按本脚本提示添加 (不要提前乱填)\n'
     printf '%s\n\n' "----------------------------------------------------"
-    read -r -s -p "Cloudflare Tunnel Token (输入不回显): " tunnel_token
+    read -e -r -s -p "Cloudflare Tunnel Token (输入不回显): " tunnel_token
     printf '\n'
     [[ -n $tunnel_token ]] || die "Tunnel Token 不能为空。"
     cloudflared service uninstall >/dev/null 2>&1 || true   # 已装过会报错, 先清掉
@@ -1720,7 +1621,7 @@ deploy_cloudflare_tunnel() {
     printf '  URL                : 127.0.0.1:%s\n' "$port"
     printf '  注意: 类型必须选 HTTP (不是 HTTPS), WebSocket 默认已开启, 无需额外设置\n'
     printf '%s\n\n' "==============================================================="
-    IFS= read -r -e -p "添加完成后按回车继续..." _ || true
+    read -e -r -p "添加完成后按回车继续..." _ || true
   else
     require_cmd cloudflared
     [[ -f /root/.cloudflared/cert.pem || -f "${HOME}/.cloudflared/cert.pem" ]] || {
@@ -1860,7 +1761,7 @@ cf_tunnel_uninstall() {
 }
 
 cf_tunnel_rebind_token() {
-  read -r -s -p "新的 Cloudflare Tunnel Token (输入不回显): " tunnel_token
+  read -e -r -s -p "新的 Cloudflare Tunnel Token (输入不回显): " tunnel_token
   printf '\n'
   [[ -n $tunnel_token ]] || die "Token 不能为空。"
   systemctl stop cloudflared 2>/dev/null || true
@@ -1883,7 +1784,7 @@ cf_tunnel_menu() {
     printf '  7) 卸载\n'
     printf '  8) 检查 / 升级 cloudflared 版本\n'
     printf '  0) 返回主菜单\n'
-    IFS= read -r -e -p '请选择: ' choice
+    read -e -r -p '请选择: ' choice
     case $choice in
       1) deploy_cloudflare_tunnel ;;
       2) cf_tunnel_status ;;
@@ -1920,18 +1821,14 @@ install_warp_client() {
   require_apt
   info "配置 Cloudflare WARP 官方 APT 源"
   install -d -m 755 /usr/share/keyrings
-  local warp_key_tmp
-  warp_key_tmp=$(mktemp)
-  run_with_progress "下载 Cloudflare WARP APT 密钥" curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg -o "$warp_key_tmp"
-  gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$warp_key_tmp"
-  rm -f "$warp_key_tmp"
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
   local codename
   codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
   tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null <<EOF
 deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
 EOF
-  run_with_progress "更新 WARP APT 索引" apt-get update -qq
-  run_with_progress "安装 Cloudflare WARP" apt-get install -y -qq cloudflare-warp
+  apt-get update -qq
+  apt-get install -y -qq cloudflare-warp
 }
 
 warp_ensure_registered() {
@@ -2057,10 +1954,10 @@ upgrade_cloudflared() {
   case "$method" in
     apt)
       info "通过 APT 升级 cloudflared..."
-      if ! run_with_progress "更新 cloudflared APT 索引" apt-get update -qq; then
+      if ! apt-get update -qq 2>>"$LOG_FILE"; then
         warn "apt-get update 部分软件源同步失败 (详见 ${LOG_FILE}), 若是第三方源导致, 通常不影响 cloudflared 官方源本身, 继续尝试升级..."
       fi
-      run_with_progress "升级 cloudflared" apt-get install -y -qq --only-upgrade cloudflared
+      apt-get install -y -qq --only-upgrade cloudflared
       ;;
     binary)
       info "通过二进制方式升级 cloudflared..."
@@ -2073,7 +1970,7 @@ upgrade_cloudflared() {
         *) die "未知的 CPU 架构 (${arch}), 无法确定二进制下载地址。" ;;
       esac
       tmp_bin=$(mktemp)
-      if ! run_with_progress "下载 cloudflared" curl -fsSL --retry 3 --connect-timeout 15 "$bin_url" -o "$tmp_bin"; then
+      if ! curl -fsSL --retry 3 --connect-timeout 15 "$bin_url" -o "$tmp_bin"; then
         rm -f "$tmp_bin"
         die "下载最新 cloudflared 二进制失败, 请检查网络连接。"
       fi
@@ -2101,7 +1998,7 @@ warp_menu() {
     printf '  2) 查看状态\n'
     printf '  3) 卸载 WARP\n'
     printf '  0) 返回主菜单\n'
-    IFS= read -r -e -p '请选择: ' choice
+    read -e -r -p '请选择: ' choice
     case $choice in
       1) install_warp ;;
       2) warp_status ;;
@@ -2133,7 +2030,7 @@ _speedtest_one() {
   # curl 在超时退出前仍会通过 -w 输出已完成部分的瞬时速率, 这里改为放宽
   # 超时时间, 并且只要 -w 输出了合法数字就采用该值 (即便传输被中途终止),
   # 只有连输出都没拿到时才归零, 避免慢速线路被误判为"下载速度为0"。
-  dl_bps=$(curl -o /dev/null -s --max-time 20 -w '%{speed_download}' "$dl_url" 2>/dev/null)
+  dl_bps=$(ui_run_cap "下载测速 ${name}" curl -o /dev/null -s --max-time 20 -w '%{speed_download}' "$dl_url")
   [[ $dl_bps =~ ^[0-9]+([.][0-9]+)?$ ]] || dl_bps=0
   dl_mbps=$(awk -v b="$dl_bps" 'BEGIN{printf "%.2f", (b*8)/1000000}')
   if (( $(awk -v b="$dl_bps" 'BEGIN{print (b==0)}') )); then
@@ -2146,7 +2043,7 @@ _speedtest_one() {
     local tmpfile
     tmpfile=$(mktemp)
     dd if=/dev/urandom of="$tmpfile" bs=1M count=8 >/dev/null 2>&1
-    ul_bps=$(curl -o /dev/null -s --max-time 20 -w '%{speed_upload}' -X POST --data-binary "@${tmpfile}" "$ul_url" 2>/dev/null)
+    ul_bps=$(ui_run_cap "上传测速 ${name}" curl -o /dev/null -s --max-time 20 -w '%{speed_upload}' -X POST --data-binary "@${tmpfile}" "$ul_url")
     [[ $ul_bps =~ ^[0-9]+([.][0-9]+)?$ ]] || ul_bps=0
     ul_mbps=$(awk -v b="$ul_bps" 'BEGIN{printf "%.2f", (b*8)/1000000}')
     if (( $(awk -v b="$ul_bps" 'BEGIN{print (b==0)}') )); then
@@ -2158,7 +2055,7 @@ _speedtest_one() {
   fi
 }
 
-_run_speedtest_impl() {
+run_speedtest() {
   require_cmd curl awk
   info "开始测速..."
   echo "--- Cloudflare (延迟 + 下载 + 上传, 官方测速接口) ---"
@@ -2174,8 +2071,6 @@ _run_speedtest_impl() {
   ok "测速完成。"
 }
 
-run_speedtest() { run_with_progress "服务器测速" --show-output _run_speedtest_impl; }
-
 _latency_only() {
   local name=$1 host=$2 latency
   latency=$(curl -o /dev/null -s --connect-timeout 3 --max-time 5 \
@@ -2190,128 +2085,14 @@ _latency_only() {
 # ===========================================================================
 # 系统诊断
 # ===========================================================================
-diag_check_ports() {
-  printf '\n[端口占用]\n'
-  if [[ -f $CONFIG_FILE ]]; then
-    jq -r '.inbounds[]? | select(.listen_port != null) | "\(.listen_port)"' "$CONFIG_FILE" | sort -u | while read -r p; do
-      if command -v ss >/dev/null 2>&1 && ss -tulnH "sport = :$p" 2>/dev/null | grep -q .; then
-        printf "  端口 %s: ${GREEN}监听中${NC}\n" "$p"
-      else
-        printf "  端口 %s: ${RED}未监听 (异常)${NC}\n" "$p"
-      fi
-    done
-  fi
-}
 
-diag_check_dns() {
-  printf '\n[DNS 解析]\n'
-  if command -v dig >/dev/null 2>&1; then
-    dig +short example.com A 2>/dev/null | head -3 || printf '  DNS 解析失败\n'
-  else
-    getent hosts example.com || printf '  DNS 解析失败\n'
-  fi
-}
 
-diag_check_network() {
-  printf '\n[网络栈]\n'
-  printf '  IPv4 出网: %s\n' "$(check_ipv4_egress && echo 可用 || echo 不可用)"
-  printf '  IPv6 出网: %s\n' "$(check_ipv6_egress && echo 可用 || echo 不可用)"
-}
 
-diag_check_bbr() {
-  printf '\n[BBR / 拥塞控制]\n'
-  printf '  当前算法: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)"
-  printf '  队列规则: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)"
-}
 
-diag_check_firewall() {
-  printf '\n[防火墙]\n'
-  if command -v ufw >/dev/null 2>&1; then
-    printf '  UFW: %s\n' "$(ufw status 2>/dev/null | head -1)"
-  else
-    printf '  UFW: 未安装\n'
-  fi
-  if command -v firewall-cmd >/dev/null 2>&1; then
-    printf '  firewalld: %s\n' "$(systemctl is-active firewalld 2>/dev/null || echo 未运行)"
-  fi
-  if command -v nft >/dev/null 2>&1; then
-    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-      printf '  nftables: 已启用本脚本管理的表 [%s]\n' "$NFT_TABLE"
-    else
-      printf '  nftables: 已安装, 本脚本尚未在其上创建规则\n'
-    fi
-  fi
-}
 
-diag_check_cloudflared() {
-  printf '\n[Cloudflare Tunnel]\n'
-  if command -v cloudflared >/dev/null 2>&1; then
-    printf '  已安装: %s (方式: %s)\n' "$(cloudflared --version 2>/dev/null | head -1)" "$(_cloudflared_install_method)"
-    printf '  服务状态: %s\n' "$(systemctl is-active cloudflared 2>/dev/null || echo 未运行)"
-  else
-    diag_skip 'Cloudflare Tunnel 未安装'
-  fi
-}
 
-diag_check_singbox() {
-  printf '\n[sing-box 配置与服务]\n'
-  if command -v sing-box >/dev/null 2>&1; then
-    printf '  版本: %s\n' "$(sing-box version | head -1)"
-    if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
-      printf '  配置语法: 通过\n'
-    else
-      printf "  配置语法: ${RED}失败${NC}\n"
-    fi
-    printf '  服务状态: %s\n' "$(systemctl is-active sing-box 2>/dev/null || echo 未运行)"
-  else
-    printf '  sing-box 未安装\n'
-  fi
-}
 
-diag_check_resources() {
-  printf '\n[系统资源]\n'
-  local pct ipct
-  df -h / | awk 'NR==2{printf "  磁盘 /: 已用 %s / %s (%s)\n",$3,$2,$5}'
-  pct=$(df --output=pcent / | tail -n1 | tr -dc '0-9')
-  ipct=$(df --output=ipcent / | tail -n1 | tr -dc '0-9')
-  (( ${pct:-0} < 90 ))  || printf "  ${RED}磁盘使用率 >= 90%%, 请清理${NC}\n"
-  (( ${ipct:-0} < 90 )) || printf "  ${RED}inode 使用率 >= 90%%${NC}\n"
-  free -m | awk '/^Mem:/{printf "  内存: 已用 %s MB / 共 %s MB, 可用 %s MB\n",$3,$2,$7}
-                 /^Swap:/{printf "  Swap: 已用 %s MB / 共 %s MB\n",$3,$2}'
-  printf '  负载: %s (CPU 核数 %s)\n' "$(cut -d' ' -f1-3 /proc/loadavg)" "$(nproc)"
-  printf '  sing-box 内存: %s\n' "$(systemctl show sing-box -p MemoryCurrent --value 2>/dev/null | awk '{ if ($1 ~ /^[0-9]+$/) printf "%.1f MB", $1/1048576; else print "未知" }')"
-  printf '  时间同步: %s\n' "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo 未知)"
-}
 
-run_diagnostics() {
-  ensure_installed
-  DIAG_ACTIVE=1; DIAG_PASS=0; DIAG_WARN=0; DIAG_FAIL=0; DIAG_SKIP=0
-  title "系统诊断"
-  diag_run_check '系统资源' diag_check_resources
-  diag_run_check '端口监听' diag_check_ports
-  diag_run_check 'DNS 解析' diag_check_dns
-  diag_run_check '网络栈' diag_check_network
-  diag_run_check 'BBR 拥塞控制' diag_check_bbr
-  diag_run_check '防火墙' diag_check_firewall
-  diag_run_check 'Cloudflare Tunnel' diag_check_cloudflared
-  diag_run_check 'sing-box 配置与服务' diag_check_singbox
-  printf '\n'
-  DIAG_ACTIVE=0
-  printf '结果：%d 通过  %d 警告  %d 异常  %d 跳过\n' "$DIAG_PASS" "$DIAG_WARN" "$DIAG_FAIL" "$DIAG_SKIP"
-  if (( DIAG_WARN || DIAG_FAIL )); then printf '建议：处理上述异常后运行 sb reconcile 检查节点记录与配置一致性。\n'; fi
-  ok "诊断完成。"
-}
-
-diag_run_check() {
-  local label=$1 fn=$2 output rc=0 state='✓'
-  output=$($fn 2>&1) || rc=$?
-  if grep -q '跳过' <<< "$output"; then state='–'; ((DIAG_SKIP+=1)) || true
-  elif (( rc != 0 )) || grep -Eq '失败|异常|不可用|未监听' <<< "$output"; then state='✗'; ((DIAG_FAIL+=1)) || true
-  elif grep -Eq '未安装|未运行|未知|警告' <<< "$output"; then state='!'; ((DIAG_WARN+=1)) || true
-  else ((DIAG_PASS+=1)) || true; fi
-  printf '%s %s\n' "$state" "$label"
-  if [[ -n $output ]]; then sed 's/^/  /' <<< "$output"; fi
-}
 # ===========================================================================
 # 订阅系统
 # 生成三类订阅文件到 SUB_DIR:
@@ -2776,7 +2557,7 @@ subscription_menu() {
     printf '  5) 删除全部订阅文件\n'
     printf '  6) 查看 / 重置订阅访问 token\n'
     printf '  0) 返回主菜单\n'
-    IFS= read -r -e -p '请选择: ' choice
+    read -e -r -p '请选择: ' choice
     case $choice in
       1) sub_build_all ;;
       2) find "$SUB_DIR" -maxdepth 1 -type f 2>/dev/null | sed 's/^/  - /' ;;
@@ -2821,7 +2602,7 @@ show_connection_qrcode() {
   printf '\n可用节点:\n'
   local i
   for i in "${!tags[@]}"; do printf '  %d) %s\n' "$((i+1))" "${tags[$i]}"; done
-  IFS= read -r -e -p "选择要显示二维码的节点编号: " idx
+  read -e -r -p "选择要显示二维码的节点编号: " idx
   [[ $idx =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#tags[@]} )) || die "无效编号。"
   tag=${tags[$((idx-1))]}
   uri=$(jq -r --arg tag "$tag" '.connections[] | select(.tag==$tag) | .uri' "$STATE_FILE")
@@ -2839,10 +2620,12 @@ remove_inbound() {
     warn "当前没有任何入站节点。"
     return 0
   fi
-  printf '\n当前已配置的入站:\n'
-  list_inbounds
-  local tag
-  if [[ -n $SELECTED_NODE_TAG ]]; then tag=$SELECTED_NODE_TAG; SELECTED_NODE_TAG=""; else tag=$(ask_required "请输入要删除的节点 tag"); fi
+  local tag=${1:-}
+  if [[ -z $tag ]]; then
+    printf '\n当前已配置的入站:\n'
+    list_inbounds
+    tag=$(ask_required "请输入要删除的节点 tag")
+  fi
   valid_safe_token "$tag" || die "非法 tag 格式。"
   jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1 || die "未找到对应的节点 tag。"
   confirm "确认删除 ${tag} 并清除关联的分流规则" N || return 0
@@ -3012,14 +2795,14 @@ _conn_save() {   # _conn_save <tag> <新uri> <新host>
     --arg t "$1" --arg u "$2" --arg h "$3"
 }
 
-SELECTED_NODE_TAG=""
 pick_connection_tag() {
-  if [[ -n $SELECTED_NODE_TAG ]]; then printf '%s' "$SELECTED_NODE_TAG"; SELECTED_NODE_TAG=""; return 0; fi
   local -a tags=(); local i idx
+  # 从节点列表 (e3 等) 进入时已选定节点, 不再重复询问
+  if [[ -n ${SEL_TAG:-} ]]; then printf '%s' "$SEL_TAG"; return 0; fi
   mapfile -t tags < <(jq -r '.connections[].tag' "$STATE_FILE")
   (( ${#tags[@]} > 0 )) || { warn "尚无节点记录。"; return 1; }
   for i in "${!tags[@]}"; do printf '  %d) %s\n' "$((i+1))" "${tags[$i]}" >&2; done
-  IFS= read -r -e -p "选择节点编号: " idx
+  read -e -r -p "选择节点编号: " idx || return 1
   [[ $idx =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#tags[@]} )) || { warn "无效编号。"; return 1; }
   printf '%s' "${tags[$((idx-1))]}"
 }
@@ -3081,7 +2864,7 @@ change_node_host() {
     warn "Tunnel 节点的域名绑定在 Cloudflare 后台, 请删除后重建。"; return 0
   fi
   old_uri=$(_conn_field "$tag" uri)
-  IFS= read -r -e -p "新的客户端连接地址 (IP 或域名): " new_host
+  read -e -r -p "新的客户端连接地址 (IP 或域名): " new_host
   if ! { valid_ipv4 "$new_host" || valid_ipv6 "$new_host" || valid_hostname "$new_host"; }; then
     warn "地址格式不正确。"; return 0
   fi
@@ -3152,23 +2935,6 @@ change_tls_domain() {
   print_result_block "$tag" "$new_uri" "$tag"
 }
 
-node_edit_menu() {
-  local choice
-  while true; do
-    title "编辑节点"
-        printf '  1) 重命名节点\n  2) 修改监听端口\n  3) 修改客户端连接地址\n  4) 修改握手域名 (Reality/ShadowTLS)\n  5) 修改 TLS 域名 (Trojan/VLESS TLS/Hy2/TUIC/AnyTLS)\n  0) 返回主菜单\n'
-    IFS= read -r -e -p '请选择: ' choice
-    case $choice in
-      1) rename_node ;;
-      2) change_node_port ;;
-      3) change_node_host ;;
-      4) change_reality_domain ;;
-      5) change_tls_domain ;;
-      0) return 0 ;;
-      *) warn "无效的编号选择。" ;;
-    esac
-  done
-}
 validate_and_restart() {
   ensure_installed
   sing-box check -c "$CONFIG_FILE"
@@ -3177,56 +2943,15 @@ validate_and_restart() {
   ok "配置校验通过, sing-box 服务已重启。"
 }
 
-show_status() {
-  ensure_installed
-  local stack v4_status="不可用" v6_status="不可用" public_ipv4 public_ipv6
-  stack=$(detect_network_stack)
-  case "$stack" in
-    dual)   v4_status="可用"; v6_status="可用" ;;
-    v4only) v4_status="可用" ;;
-    v6only) v6_status="可用" ;;
-  esac
-  public_ipv4=$(detect_public_ip || true)
-  public_ipv6=$(detect_public_ipv6 || true)
-  printf '\nsing-box 版本: '; sing-box version | head -n 1
-  printf '出站 IP 版本策略: domain_resolver (dns tag: %s)\n' "$SB_DNS_RESOLVER_TAG"
-  printf '网络栈判定: %s\n' "$stack"
-  printf '外网栈连通性: IPv4 [%s] | IPv6 [%s]\n' "$v4_status" "$v6_status"
-  printf '公网 IPv4: %s\n' "${public_ipv4:-未检测到}"
-  printf '公网 IPv6: %s\n' "${public_ipv6:-未检测到}"
-  printf '\n服务运行状态:\n'
-  systemctl --no-pager --full status sing-box || true
-  printf '\n当前入站与监听:\n'
-  jq -r '.inbounds[]? | "- \(.tag) [\(.type)] 监听 \(.listen // "Detour"):\(.listen_port // "-")"' "$CONFIG_FILE"
-}
 
 show_logs() { journalctl -u sing-box -n 150 --no-pager -o cat; }
 
-health_check() {
-  ensure_installed
-  local failed=0
-  printf '\nsing-box 语法检测: '
-  if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then printf '通过\n'; else printf '失败\n'; failed=1; fi
-  printf 'sing-box 服务状态: '
-  if systemctl is-active --quiet sing-box; then printf '运行中\n'; else printf '未运行\n'; failed=1; fi
-  if command -v cloudflared >/dev/null 2>&1; then
-    printf 'cloudflared 状态: '
-    if systemctl is-active --quiet cloudflared; then printf '运行中\n'; else printf '未运行\n'; failed=1; fi
-  fi
-  if command -v warp-cli >/dev/null 2>&1; then
-    printf 'WARP 状态: '
-    warp-cli --accept-tos status 2>/dev/null | grep -qi Connected && printf '已连接\n' || { printf '未连接\n'; failed=1; }
-  fi
-  printf '\n出站规则列表:\n'
-  jq -r '.outbounds[]? | "- \(.tag) [\(.type)] domain_resolver 策略: \(.domain_resolver.strategy // "默认")"' "$CONFIG_FILE"
-  if (( failed == 0 )); then ok "各项健康检查正常"; else warn "健康检查发现异常, 请运行 'sb logs' 或 'sb diag' 排查。"; fi
-}
 
 update_manager() {
   local candidate
   candidate=$(mktemp)
   info "从远程仓库拉取脚本更新: $SCRIPT_UPDATE_URL"
-  run_with_progress "下载管理脚本更新" curl -fL --proto '=https' --tlsv1.2 "$SCRIPT_UPDATE_URL" -o "$candidate"
+  curl -fL --proto '=https' --tlsv1.2 "$SCRIPT_UPDATE_URL" -o "$candidate"
   bash -n "$candidate" || { rm -f "$candidate"; die "下载的脚本语法校验失败, 已拒绝安装。"; }
   install -D -m 700 "$candidate" "$MANAGER_PATH"
   rm -f "$candidate"
@@ -3245,10 +2970,10 @@ upgrade_sing_box() {
   # APT 源) GPG 密钥过期/失效, 整个命令就会以非零退出, 在 set -e 下会连累
   # sing-box 官方源 (sagernet) 本身没问题也升级不了。这里不因此中断,
   # 仅告警提示, 成功同步的源 (通常包含 sagernet) 其索引已经落盘可用。
-  if ! run_with_progress "更新 sing-box APT 索引" apt-get update -qq; then
+  if ! apt-get update -qq 2>>"$LOG_FILE"; then
     warn "apt-get update 部分软件源同步失败 (详见 ${LOG_FILE}), 可能是第三方源 (如 cloudflared) GPG 密钥过期导致, 与 sing-box 官方源无关; 继续尝试升级..."
   fi
-  run_with_progress "升级 sing-box" apt-get install -y -qq --only-upgrade sing-box
+  apt-get install -y -qq --only-upgrade sing-box
   validate_and_restart
   ok "更新完成: $(sing-box version | head -n 1)"
 }
@@ -3311,7 +3036,7 @@ purge_all() {
   printf '  - 本脚本开过的防火墙放行规则 (iptables/ip6tables/nftables)\n'
   warn "此操作不可逆, 且不会创建任何备份。"
   local confirm_text
-  IFS= read -r -e -p "请输入大写 DELETE 以确认继续: " confirm_text
+  read -e -r -p "请输入大写 DELETE 以确认继续: " confirm_text
   [[ $confirm_text == DELETE ]] || { warn "输入不匹配, 已取消。"; return 0; }
 
   info "停止并禁用相关服务..."
@@ -3370,317 +3095,1424 @@ purge_all() {
 
   ok "彻底清除完成。云厂商安全组规则 (如有) 本脚本管不到, 仍需自行去控制台清理。"
 }
-node_management_menu() {
-  local choice action idx tag type port uri name status fw listen proto row i
-  while true; do
-    title "节点管理"
-    printf ' #  状态  协议              端口  防火墙  监听  名称\n'
-    local -a tags=()
-    mapfile -t tags < <(jq -r '.connections[]?.tag' "$STATE_FILE" 2>/dev/null)
-    for i in "${!tags[@]}"; do
-      tag=${tags[$i]}; type=$(_conn_field "$tag" type); port=$(_conn_field "$tag" port); uri=$(_conn_field "$tag" uri)
-      name=$(printf '%s' "$uri" | sed -n 's/.*#//p')
-      proto=${type%%-*}; status='✓'; fw='?'; listen='?'
-      if [[ -n $port ]]; then
-        if _type_protocols "$type" | while IFS= read -r proto; do _fw_port_allowed "$port" "$proto" && exit 0; done; then fw='✓'; else fw='✗'; status='!'; fi
-        if command -v ss >/dev/null 2>&1 && ss -lntu 2>/dev/null | grep -qE ":${port}[[:space:]]"; then listen='✓'; else listen='✗'; status='!'; fi
-      fi
-      printf ' %2d  %s    %-16s %5s    %s      %s   %s\n' "$((i+1))" "$status" "$type" "${port:-—}" "$fw" "$listen" "${name:-$tag}"
-    done
-    printf '\n动作+编号: q二维码 c复制 e编辑 d删除 f修复防火墙 l日志；0返回\n'
-    IFS= read -r -e -p '选择: ' choice || return 0
-    [[ $choice == 0 ]] && return 0
-    [[ $choice =~ ^([qcedfl])([0-9]+)$ ]] || { warn '格式无效，请使用例如 e3 或 q2。'; continue; }
-    action=${BASH_REMATCH[1]}; idx=${BASH_REMATCH[2]}
-    (( idx >= 1 && idx <= ${#tags[@]} )) || { warn '不存在该节点编号。'; continue; }
-    tag=${tags[$((idx-1))]}
-    case $action in
-      q) uri=$(_conn_field "$tag" uri); show_qrcode "$uri" "$tag" ;;
-      c) uri=$(_conn_field "$tag" uri); osc52_copy "$uri"; info '已发送 OSC 52 复制请求。' ;;
-      e) SELECTED_NODE_TAG=$tag; node_edit_menu ;;
-      d) SELECTED_NODE_TAG=$tag; remove_inbound ;;
-      f) port=$(_conn_field "$tag" port); type=$(_conn_field "$tag" type); while IFS= read -r proto; do open_firewall_port "$port" "$proto"; done < <(_type_protocols "$type") ;;
-      l) show_logs ;;
-    esac
-  done
-}
-
-diag_ops_menu() {
-  local choice
-  while true; do
-    title "诊断与运维"
-    printf '  1) 查看服务状态与网络栈\n'
-    printf '  2) 查看实时运行日志\n'
-    printf '  3) 校验配置并重启服务\n'
-    printf '  4) 系统健康检查\n'
-    printf '  5) 系统诊断 (端口/DNS/BBR/防火墙/Tunnel/配置)\n'
-    printf '  6) 检查并修复孤儿节点 (reconcile)\n'
-    printf '  0) 返回主菜单\n'
-    IFS= read -r -e -p '请选择: ' choice
-    case $choice in
-      1) show_status ;;
-      2) show_logs ;;
-      3) validate_and_restart ;;
-      4) health_check ;;
-      5) run_diagnostics ;;
-      6) reconcile_nodes ;;
-      0) return 0 ;;
-      *) warn "无效的编号选择。" ;;
-    esac
-  done
-}
-
-system_maintenance_menu() {
-  local choice
-  while true; do
-    title "系统维护"
-    printf '  1) 证书管理\n'
-    printf '  2) 启用 BBR 拥塞控制\n'
-    printf '  3) 恢复最近一次配置备份\n'
-    printf '  4) 安装 / 修复官方 sing-box 环境\n'
-    printf '  5) 更新 sing-box 核心\n'
-    printf '  6) 从 GitHub 更新本脚本\n'
-    printf '  7) 卸载 sing-box (保留配置/数据)\n'
-    printf '  8) 彻底清除 (软件包+配置+证书+防火墙, 不可逆)\n'
-    printf '  0) 返回主菜单\n'
-    IFS= read -r -e -p '请选择: ' choice
-    case $choice in
-      1) cert_management_menu ;;
-      2) enable_bbr ;;
-      3) restore_backup ;;
-      4) install_sing_box ;;
-      5) upgrade_sing_box ;;
-      6) update_manager ;;
-      7) uninstall_sing_box ;;
-      8) purge_all ;;
-      0) return 0 ;;
-      *) warn "无效的编号选择。" ;;
-    esac
-  done
-}
-
 # ===========================================================================
-# 菜单交互
+# 终端交互层 (v0.1.0)
+#   显示宽度 / 截断 / 进度包装 / 剪贴板 / 徽标 / 二维码 / 结果块
 # ===========================================================================
-print_startup_logo() {
-  local cols=${COLUMNS:-80} locale=${LC_ALL:-${LANG:-}}
-  if [[ ! -t 1 || -n ${NO_COLOR:-} || ( $locale != *UTF-8* && $locale != *utf8* ) || $cols -lt 40 ]]; then
-    printf '%s\n' 'LINONO | singbox VPS 双栈智能管理'; return 0
-  fi
-  printf '             \033[38;2;1;168;254m▄\033[38;2;1;166;254;48;2;0;158;254m▀\033[38;2;0;157;254;48;2;6;118;248m▀        \033[0m\n'
-  printf '         \033[38;2;2;192;254m▄\033[38;2;0;197;254;48;2;1;169;255m▀\033[38;2;0;176;253;48;2;0;170;254m▀\033[38;2;1;168;253;48;2;1;172;253m▀\033[38;2;1;113;254;48;2;0;111;254m▀\033[38;2;0;101;252m▀ \033[38;2;250;6;15m▄\033[38;2;252;6;14m▄\033[38;2;254;0;9;48;2;251;7;16m▀\033[38;2;254;4;13;48;2;251;10;16m▀\033[38;2;253;11;10;48;2;249;19;16m▀\033[38;2;253;30;15;48;2;250;32;17m▀\033[38;2;253;50;18m▄ \033[0m\n'
-  printf '        \033[38;2;2;199;254;48;2;0;186;252m▀\033[38;2;0;175;254;48;2;0;184;253m▀\033[38;2;0;172;254;48;2;0;117;254m▀\033[38;2;0;126;254;48;2;1;121;254m▀\033[38;2;0;119;254;48;2;0;123;252m▀\033[38;2;1;63;245m▀ \033[38;2;253;83;9m▀    \033[38;2;253;59;20m▀\033[38;2;253;53;15;48;2;253;78;15m▀\033[38;2;252;57;17;48;2;252;78;15m▀\033[38;2;253;63;18;48;2;253;66;17m▀\033[0m\n'
-  printf '     \033[38;2;252;26;15m▄\033[38;2;251;36;11m▄\033[38;2;2;189;255;48;2;0;176;252m▀\033[38;2;0;155;253;48;2;0;119;254m▀\033[38;2;0;119;254;48;2;1;118;254m▀\033[38;2;0;120;253;48;2;1;112;253m▀\033[38;2;0;113;252;48;2;0;50;235m▀\033[38;2;0;41;226;48;2;0;51;235m▀\033[38;2;215;225;255m▀      \033[38;2;254;137;6;48;2;253;159;6m▀\033[38;2;252;109;7;48;2;253;137;5m▀\033[38;2;252;97;11m▀ \033[0m  \033[38;5;40mL\033[38;5;45mI\033[38;5;75mN\033[38;5;135mO\033[38;5;220mN\033[38;5;196mO\033[0m\n'
-  printf ' \033[38;2;251;14;14m▄\033[38;2;254;65;66;48;2;251;13;14m▀\033[38;2;251;12;19;48;2;252;17;15m▀\033[38;2;253;23;13m▀ \033[38;2;18;162;251m▄\033[38;2;0;151;254;48;2;0;112;253m▀\033[38;2;0;116;252;48;2;0;114;253m▀\033[38;2;0;120;253;48;2;0;49;232m▀\033[38;2;0;48;232;48;2;0;55;236m▀\033[38;2;0;52;235;48;2;0;106;254m▀\033[38;2;0;68;242;48;2;1;214;254m▀    \033[38;2;254;219;12m▄\033[38;2;254;220;11m▄\033[38;2;253;191;6;48;2;253;221;101m▀\033[38;2;254;177;6m▀   \033[0m  singbox VPS 双栈智能管理\n'
-  printf '\033[38;2;252;55;12m▄\033[38;2;251;34;14;48;2;254;134;7m▀\033[38;2;253;22;14m▀   \033[38;2;0;122;250;48;2;1;105;253m▀\033[38;2;1;114;254;48;2;0;44;228m▀\033[38;2;0;47;232;48;2;0;49;232m▀\033[38;2;0;53;236;48;2;1;95;251m▀\033[38;2;0;108;253;48;2;0;136;253m▀\033[38;2;0;172;251;48;2;1;188;254m▀ \033[38;2;253;249;34m▄\033[38;2;254;250;11m▄\033[38;2;254;246;21;48;2;254;249;10m▀\033[38;2;254;241;17;48;2;254;252;47m▀\033[38;2;253;246;16m▄\033[38;2;254;237;10m▄\033[38;2;254;215;5m▄\033[38;2;254;217;5m▄\033[38;2;253;218;6m▄\033[38;2;254;217;7m▄\033[38;2;254;215;7m▄\033[0m\n'
-  printf '\033[38;2;253;88;7m▀\033[38;2;253;161;3;48;2;253;184;4m▀\033[38;2;252;199;4m▄\033[38;2;253;242;17m▄ \033[38;2;0;59;241m▄\033[38;2;0;37;229;48;2;0;39;228m▀\033[38;2;0;46;230;48;2;249;247;82m▀\033[38;2;0;64;242;48;2;246;246;88m▀\033[38;2;1;124;254;48;2;253;171;24m▀\033[38;2;252;151;0m▄\033[38;2;253;178;2m▄\033[38;2;254;216;5;48;2;253;188;1m▀\033[38;2;253;226;6;48;2;254;209;5m▀\033[38;2;253;249;10;48;2;253;228;5m▀\033[38;2;253;251;12;48;2;22;215;51m▀\033[38;2;253;249;9;48;2;84;225;47m▀\033[38;2;253;244;11;48;2;77;224;40m▀\033[38;2;254;238;9;48;2;116;233;35m▀\033[38;2;254;237;8;48;2;126;233;33m▀\033[38;2;254;219;6;48;2;130;232;34m▀\033[38;2;253;216;5;48;2;138;232;36m▀\033[38;2;254;228;16m▀ \033[0m\n'
-  printf ' \033[38;2;253;237;10m▀\033[38;2;253;245;13m▀\033[38;2;253;245;16;48;2;253;247;20m▀\033[38;2;253;248;31;48;2;254;217;27m▀\033[38;2;253;251;58;48;2;253;38;23m▀\033[38;2;253;253;76;48;2;253;40;17m▀\033[38;2;252;251;81;48;2;253;43;18m▀\033[38;2;252;60;10;48;2;252;49;20m▀\033[38;2;253;86;7;48;2;3;154;54m▀\033[38;2;254;135;4;48;2;3;168;57m▀\033[38;2;254;133;4;48;2;1;176;57m▀\033[38;2;254;143;3;48;2;2;182;60m▀\033[38;2;4;196;62;48;2;6;195;60m▀\033[38;2;9;205;55;48;2;4;197;61m▀\033[38;2;21;211;52;48;2;6;202;59m▀\033[38;2;60;223;44;48;2;19;210;54m▀\033[38;2;67;224;44;48;2;24;213;56m▀\033[38;2;92;230;42;48;2;32;214;55m▀\033[38;2;92;226;43m▀\033[38;2;114;230;39m▀   \033[0m\n'
-  printf '    \033[38;2;91;182;129m▀\033[38;2;2;148;51m▀\033[38;2;3;152;54m▀\033[38;2;3;153;55m▀\033[38;2;2;154;57;48;2;4;175;60m▀\033[38;2;3;161;58;48;2;3;168;58m▀\033[38;2;3;171;59;48;2;3;173;59m▀\033[38;2;2;181;57;48;2;2;177;60m▀\033[38;2;2;182;60;48;2;3;179;60m▀\033[38;2;3;192;61;48;2;3;183;62m▀\033[38;2;3;194;61m▀\033[38;2;3;199;60m▀\033[38;2;9;204;58m▀\033[38;2;15;209;58m▀      \033[0m\n'
+UI_WV=0
+# 计算显示宽度 (全角/宽字符/emoji 记 2 列), 结果写入 UI_WV, 避免子进程开销
+ui_wv() {
+  local s=$1 i ch cp w=0 n=${#1}
+  for ((i=0; i<n; i++)); do
+    ch=${s:i:1}
+    printf -v cp '%d' "'$ch" 2>/dev/null || cp=0
+    if (( (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) \
+       || (cp >= 0xfe30 && cp <= 0xfe6f) || (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) \
+       || (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x1f300 && cp <= 0x1faff) )); then
+      w=$((w+2))
+    else
+      w=$((w+1))
+    fi
+  done
+  UI_WV=$w
+}
+ui_w() { ui_wv "$1"; printf '%s' "$UI_WV"; }
+
+# ui_pad <文本> <目标宽度>: 按显示宽度右侧补空格
+ui_pad() {
+  local pad
+  ui_wv "$1"
+  pad=$(( $2 - UI_WV ))
+  if (( pad < 0 )); then pad=0; fi
+  printf '%s%*s' "$1" "$pad" ''
 }
 
-MAIN_MENU_ROWS=(
-  '1|新建节点|快速部署 / 14 种协议|new_nodes_menu'
-  '2|节点列表|查看 / 二维码 / 编辑 / 删除|node_management_menu'
-  '3|订阅与分发|Base64 / Clash / sing-box|subscription_menu'
-  '4|出站与穿透|WARP / Cloudflare Tunnel|egress_menu'
-  '5|诊断与测速|体检 / 对账 / 日志 / 测速|diagnostics_menu'
-  '6|系统维护|证书 / BBR / 备份 / 升级|system_maintenance_menu'
-)
-
-print_main_menu() {
-  local service='未知' nodes=0 ips='' v4='-' v6='-' core='?'
-  service=$(systemctl is-active sing-box 2>/dev/null || printf '未知')
-  if [[ -r $STATE_FILE ]]; then nodes=$(jq -r '.connections | length' "$STATE_FILE" 2>/dev/null || printf '0'); fi
-  ips=$(get_cached_public_ips 2>/dev/null || true); v4=${ips%%|*}; v6=${ips#*|}
-  [[ -n $v4 ]] || v4='-'; [[ -n $v6 ]] || v6='-'
-  core=$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || printf '?')
-  print_startup_logo
-  local locale=${LC_ALL:-${LANG:-}} term_cols=${COLUMNS:-0}
-  if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then term_cols=$(tput cols 2>/dev/null || printf '%s' "$term_cols"); fi
-  if [[ -t 1 && -z ${NO_COLOR:-} && ( $locale == *UTF-8* || $locale == *utf8* ) ]] && (( term_cols >= 84 )); then
-    # The logo is nine terminal rows tall. Overlay the live status block beside it.
-    printf '\033[4A\033[36G\033[38;5;40m●\033[0m %s  sing-box %s  节点 %s\n' "$service" "$core" "$nodes"
-    printf '\033[36G\033[38;5;45mv4 %s\033[0m\n' "$v4"
-    printf '\033[36G\033[38;5;45mv6 %s\033[0m\n' "$v6"
-    printf '\033[1B\r'
-  else
-    printf '● %s  sing-box %s  节点 %s  v4 %s  v6 %s\n' "$service" "$core" "$nodes" "$v4" "$v6"
-  fi
-  printf '%s\n' '────────────────────────────────────────────────────────────────────────'
-  local row n label desc handler
-  for row in "${MAIN_MENU_ROWS[@]}"; do IFS='|' read -r n label desc handler <<< "$row"; printf ' %s  %-14s  %s  ▸\n' "$n" "$label" "$desc"; done
-  printf ' 0  退出\n'
-  printf '%s\n' '────────────────────────────────────────────────────────────────────────'
+# ui_trunc <文本> <最大宽度>: 超宽时截断并加省略号
+ui_trunc() {
+  local s=$1 max=$2 i ch out="" w=0 cw
+  ui_wv "$s"
+  if (( UI_WV <= max )); then printf '%s' "$s"; return 0; fi
+  for ((i=0; i<${#s}; i++)); do
+    ch=${s:i:1}
+    ui_wv "$ch"; cw=$UI_WV
+    if (( w + cw > max - 1 )); then break; fi
+    out+=$ch; w=$((w+cw))
+  done
+  printf '%s%s' "$out" "$G_ELL"
 }
 
-read_menu_choice() {
-  local __prompt=$2
-  local -n __target=$1
-  if ! IFS= read -r -e -p "$__prompt" __target; then return 1; fi
+# 终端宽度: 每次重绘重新读取, 窗口大小变化后自动适配
+ui_cols() {
+  local c=""
+  if [[ -t 1 || -t 2 ]]; then c=$(stty size 2>/dev/null </dev/tty | awk '{print $2}' || true); fi
+  if ! [[ $c =~ ^[0-9]+$ ]] || (( c < 1 )); then c=${COLUMNS:-80}; fi
+  if ! [[ $c =~ ^[0-9]+$ ]] || (( c < 1 )); then c=80; fi
+  printf '%s' "$c"
 }
 
-run_menu_action() {
-  local fn=$1 rc=0
-  ( MENU_ACTION_ACTIVE=1; "$fn" ) || rc=$?
-  case $fn in
-    node_management_menu|subscription_menu|egress_menu|diagnostics_menu|system_maintenance_menu|new_nodes_menu|warp_menu|cf_tunnel_menu|cert_management_menu|diag_ops_menu) return 0 ;;
-  esac
-  if (( rc != 0 )); then warn "本次操作未完成 (状态码 $rc)，按回车返回菜单（不会退出脚本）"; else printf '\n── 按回车返回菜单 ──'; fi
-  local _pause; IFS= read -r _pause || true
+ui_hr() {
+  local w line cols
+  cols=$(ui_cols); w=$cols
+  if (( w > 62 )); then w=62; fi
+  printf -v line '%*s' "$w" ''
+  printf '%s%s%s\n' "$DIM" "${line// /$G_HH}" "$NC"
+}
+
+ui_pause() {
+  local msg=${1-"── 按回车返回菜单 ──"}
+  [[ -t 0 && -t 1 ]] || return 0
+  read -e -r -p "$msg" _ || true
   return 0
 }
 
-new_nodes_menu() {
-  local c
+# ---------------------------------------------------------------------------
+# 长操作进度: 屏幕只留一行 "⠹ 步骤名 ... 耗时", 完成改 ✓, 详细输出进日志,
+# 失败自动展开日志最后 10 行并给出日志路径。进度写 stderr, 因此可在 $(...) 内使用。
+#   UI_SOFT=1  失败只显示 ! (不展开日志, 由调用者决定)
+#   UI_SOFT=2  无论返回码都显示 ✓ (如测速被超时截断仍属正常)
+# ---------------------------------------------------------------------------
+UI_IN_RUN=""
+UI_BG_PID=""
+ui_now_us() {
+  local t=${EPOCHREALTIME:-}
+  if [[ -n $t ]]; then t=${t/[.,]/}; printf '%s' "$t"; else printf '%s' "$(( $(date +%s) * 1000000 ))"; fi
+}
+
+ui_run() {
+  local name=$1; shift
+  local soft=${UI_SOFT:-0} cap=${UI_CAPTURE:-}
+  if [[ -n $UI_IN_RUN ]]; then     # 嵌套调用: 直接执行, 输出并入外层日志
+    if [[ -n $cap ]]; then "$@" >"$cap" || true; else "$@"; fi
+    return 0
+  fi
+  local tmp rc=0 t0 t1 el pid i=0 istty=0
+  [[ -t 2 ]] && istty=1
+  tmp=$(mktemp)
+  t0=$(ui_now_us)
+  if [[ -n $cap ]]; then
+    ( UI_IN_RUN=1; "$@" ) >"$cap" 2>"$tmp" </dev/null &
+  else
+    ( UI_IN_RUN=1; "$@" ) >"$tmp" 2>&1 </dev/null &
+  fi
+  pid=$!; UI_BG_PID=$pid
+  if (( istty )); then
+    while kill -0 "$pid" 2>/dev/null; do
+      t1=$(ui_now_us); el=$(( t1 - t0 ))
+      printf '\r\033[K %s%s%s %s %s %s%d.%ds%s' "$CYAN" "${G_SPIN[i % ${#G_SPIN[@]}]}" "$NC" "$name" "$G_ELL" \
+        "$DIM" $((el/1000000)) $(((el%1000000)/100000)) "$NC" >&2
+      i=$((i+1))
+      sleep 0.1
+    done
+    printf '\r\033[K' >&2
+  else
+    printf ' %s %s\n' "$G_ELL" "$name" >&2
+  fi
+  wait "$pid" || rc=$?
+  UI_BG_PID=""
+  t1=$(ui_now_us); el=$(( t1 - t0 ))
+  if (( rc == 0 || soft == 2 )); then
+    printf ' %s%s%s %s  %s%d.%ds%s\n' "$GREEN" "$G_OK" "$NC" "$name" "$DIM" $((el/1000000)) $(((el%1000000)/100000)) "$NC" >&2
+  elif (( soft == 1 )); then
+    printf ' %s%s%s %s  %s(未完成, 状态码 %s)%s\n' "$YELLOW" "$G_WARN" "$NC" "$name" "$DIM" "$rc" "$NC" >&2
+  else
+    printf ' %s%s%s %s  %s%d.%ds%s\n' "$RED" "$G_X" "$NC" "$name" "$DIM" $((el/1000000)) $(((el%1000000)/100000)) "$NC" >&2
+    tail -n 10 "$tmp" 2>/dev/null | while IFS= read -r line; do printf '   %s%s%s %s\n' "$DIM" "$G_BAR" "$NC" "$line" >&2; done
+    printf '   %s%s%s 完整日志: %s\n' "$DIM" "$G_END" "$NC" "$LOG_FILE" >&2
+  fi
+  { printf '%s [STEP rc=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$rc" "$name"; cat "$tmp"; } >> "$LOG_FILE" 2>/dev/null || true
+  rm -f "$tmp"
+  return "$rc"
+}
+
+# 捕获命令 stdout 并原样输出 (进度走 stderr), 始终返回 0
+ui_run_cap() {
+  local name=$1; shift
+  local f
+  f=$(mktemp)
+  UI_CAPTURE=$f UI_SOFT=2 ui_run "$name" "$@" || true
+  cat "$f"
+  rm -f "$f"
+}
+
+_apt_update_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq "$@"
+}
+
+# ---------------------------------------------------------------------------
+# 剪贴板 (OSC 52, tmux/screen 自动封装; 不支持时静默无效, 始终保留 p 显示完整链接)
+# ---------------------------------------------------------------------------
+ui_copy() {
+  local text=$1 b64 seq
+  if [[ ! -t 1 ]]; then warn "非终端环境, 无法写入剪贴板; 请用 p 显示完整链接。"; return 0; fi
+  b64=$(printf '%s' "$text" | base64 | tr -d '\n')
+  if [[ -n ${TMUX:-} ]]; then
+    seq=$'\033Ptmux;\033\033]52;c;'"$b64"$'\a\033\\'
+  elif [[ ${TERM:-} == screen* ]]; then
+    seq=$'\033P\033]52;c;'"$b64"$'\a\033\\'
+  else
+    seq=$'\033]52;c;'"$b64"$'\a'
+  fi
+  printf '%s' "$seq"
+  ok "已发送到终端剪贴板 (OSC 52); 若粘贴为空说明终端不支持, 请用 p 显示完整链接。"
+  return 0
+}
+
+# 连接串过长时中间截断
+ui_show_uri() {
+  local uri=$1 cols n
+  cols=$(ui_cols)
+  ui_wv "$uri"
+  if (( UI_WV > cols - 2 )); then
+    n=$(( cols - 16 ))
+    if (( n < 12 )); then n=12; fi
+    printf '%s%s%s%s%s\n' "${uri:0:n}" "$G_ELL" "${uri: -8}" "$DIM" " [已截断]${NC}"
+  else
+    printf '%s\n' "$uri"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 二维码: <60 列或二维码比终端宽时跳过渲染, 只提示 PNG 路径
+# ---------------------------------------------------------------------------
+show_qrcode() {
+  local uri=$1 tag=${2:-node} cols png qrw
+  if ! command -v qrencode >/dev/null 2>&1; then
+    UI_SOFT=1 ui_run "安装 qrencode" _apt_update_install qrencode || true
+  fi
+  if ! command -v qrencode >/dev/null 2>&1; then
+    warn "qrencode 未安装, 已跳过二维码渲染。"
+    return 0
+  fi
+  png="${QR_CACHE_DIR}/${tag}.png"
+  qrencode -t PNG -o "$png" -m 1 <<<"$uri" 2>/dev/null || true
+  cols=$(ui_cols)
+  if (( cols < 60 )); then
+    warn "终端过窄 (<60 列), 已跳过二维码渲染。"
+    printf '  PNG: %s\n' "$png"
+    return 0
+  fi
+  qrw=$(qrencode -t ASCII -m 1 <<<"$uri" 2>/dev/null | awk 'NR==1{print int(length($0)/2)}' || true)
+  if [[ $qrw =~ ^[0-9]+$ ]] && (( qrw > cols )); then
+    warn "二维码宽 ${qrw} 列, 超过终端宽度 ${cols}, 已跳过渲染。"
+    printf '  PNG: %s\n' "$png"
+    return 0
+  fi
+  printf '\n'
+  if (( UI_COLOR && UI_UTF8 )); then qrencode -t ANSIUTF8 -m 1 <<<"$uri"
+  elif (( UI_UTF8 )); then qrencode -t UTF8 -m 1 <<<"$uri"
+  else qrencode -t ASCII -m 1 <<<"$uri"; fi
+  printf '  %sPNG: %s%s\n' "$DIM" "$png" "$NC"
+  return 0
+}
+
+print_result_block() {
+  local title=$1 uri=$2 tag=$3 type port proto list="" fam a
+  PENDING_TAG=""
+  printf '\n%s%s%s 客户端连接串:\n' "$BOLD" "$title" "$NC"
+  ui_show_uri "$uri"
+  type=$(_conn_field "$tag" type 2>/dev/null || true)
+  port=$(_conn_field "$tag" port 2>/dev/null || true)
+  if [[ -n $type && $type != vless-ws-cloudflare-tunnel && $port =~ ^[0-9]+$ ]]; then
+    for proto in $(_proto_fw_protocols "$type"); do list+="${list:+, }${port}/${proto}"; done
+    case $type in
+      *-v4) fam="仅 IPv4 一条" ;;
+      *-v6) fam="仅 IPv6 一条" ;;
+      *)    fam="IPv4 与 IPv6 各一条" ;;
+    esac
+    printf '%s%s%s 云厂商安全组还需手动放行 %s%s%s（%s）\n' "$YELLOW" "$G_WARN" "$NC" "$BOLD" "$list" "$NC" "$fam"
+  fi
+  printf '\n'
+  UI_SOFT=1 ui_run "刷新订阅文件" sub_build_all || warn "订阅文件自动刷新失败, 可稍后运行 'sb sub' 手动刷新。"
+  if [[ ! ( -t 0 && -t 1 ) ]]; then printf '%s\n' "$uri"; return 0; fi
+  printf '%sc%s 复制  %sp%s 完整链接  %sq%s 二维码  %s回车 返回%s\n' "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$DIM" "$NC"
   while true; do
-    title '新建节点'
-    printf '  1  快速部署 VLESS Reality (双栈默认流程)\n'
-    printf '  2  Reality 自定义 (IPv4)\n  3  Reality 自定义 (IPv6)\n  4  Reality gRPC\n  5  ShadowTLS v3 + SS2022\n'
-    printf '  6  Shadowsocks 2022 [UDP]\n  7  Snell [sing-box >= 1.14]\n'
-    printf '  8  Trojan  9  VLESS TLS  10 Hysteria2 [UDP]  11 TUIC v5 [UDP]\n  12 AnyTLS  13 NaiveProxy\n  14 Cloudflare Tunnel\n  0 返回\n'
-    read_menu_choice c '请选择: ' || return 0; [[ -z $c ]] && continue
-    case $c in
-      1) run_menu_action deploy_reality_quick ;;
-      2) run_menu_action deploy_reality_v4 ;;
-      3) run_menu_action deploy_reality_v6 ;;
-      4) run_menu_action deploy_vless_reality_grpc ;;
-      5) run_menu_action deploy_shadowtls_ss2022 ;;
-      6) run_menu_action deploy_shadowsocks ;;
-      7) run_menu_action deploy_snell ;;
-      8) run_menu_action deploy_trojan ;;
-      9) run_menu_action deploy_vless ;;
-      10) run_menu_action deploy_hysteria2 ;;
-      11) run_menu_action deploy_tuic ;;
-      12) run_menu_action deploy_anytls ;;
-      13) run_menu_action deploy_naive ;;
-      14) run_menu_action cf_tunnel_menu ;;
-      0) return 0 ;; *) warn '无效选择' ;;
+    read -e -r -p "> " a || break
+    case ${a//[[:space:]]/} in
+      c|C) ui_copy "$uri" ;;
+      p|P) printf '\n%s\n\n' "$uri" ;;
+      q|Q) show_qrcode "$uri" "$tag" ;;
+      '')  break ;;
+      *)   warn "未知操作 “${a}”, 可用: c / p / q / 回车" ;;
     esac
   done
+  return 0
 }
-deploy_reality_quick() {
-  local answer port ips host domain value
-  port=$(quick_reality_port) || { warn '未找到候选端口；请用 Reality 自定义部署。'; return 0; }
-  ips=$(get_cached_public_ips 2>/dev/null || true); host=${ips%%|*}; [[ -n $host ]] || host='自动探测失败'
-  domain=${REALITY_PRESET_DOMAINS[0]}
-  QUICK_PORT=$port; QUICK_HOST=$host; QUICK_DOMAIN=$domain; QUICK_NAME='Reality-dual'
-  while true; do
-    printf '\n快速部署摘要\n  模式: Dual 双栈\n  端口: %s%s\n  握手域名: %s (检查 TLS 1.3)\n  连接地址: %s\n  节点名: %s\n' "$QUICK_PORT" "$([[ $QUICK_PORT == 443 ]] || printf ' (443 占用或手动选择，已顺延)')" "$QUICK_DOMAIN" "$QUICK_HOST" "$QUICK_NAME"
-    printf '回车确认 / e逐项修改 / 0取消\n'
-    IFS= read -r -e -p '选择: ' answer || return 0
-    if [[ $answer == 0 ]]; then return 0
-    elif [[ $answer == e || $answer == E ]]; then
-      IFS= read -r -e -i "$QUICK_PORT" -p '端口: ' value || return 0; value=${value:-$QUICK_PORT}
-      valid_port "$value" || { warn '端口必须为 1-65535'; continue; }
-      if port_is_used_in_config "$value" || { command -v ss >/dev/null 2>&1 && ss -tulnH "sport = :$value" 2>/dev/null | grep -q .; }; then warn "端口 $value 已占用。"; continue; fi
-      QUICK_PORT=$((10#$value))
-      IFS= read -r -e -i "$QUICK_HOST" -p '连接地址: ' value || return 0; value=${value:-$QUICK_HOST}
-      valid_ipv4 "$value" || valid_ipv6 "$value" || valid_hostname "$value" || { warn '连接地址需为有效 IP 或域名。'; continue; }; QUICK_HOST=$value
-      IFS= read -r -e -i "$QUICK_DOMAIN" -p 'Reality 握手域名: ' value || return 0; value=${value:-$QUICK_DOMAIN}
-      valid_hostname "$value" || { warn '握手域名格式无效。'; continue; }; QUICK_DOMAIN=$value
-      IFS= read -r -e -i "$QUICK_NAME" -p '节点名: ' value || return 0; value=${value:-$QUICK_NAME}
-      (( ${#value} <= 64 )) || { warn '节点名最多 64 字符。'; continue; }; QUICK_NAME=$value
-      continue
-    elif [[ -n $answer ]]; then warn '无效选择。'; continue; fi
-    break
-  done
-  QUICK_MODE=1
-  deploy_vless_reality_unified dual
-  QUICK_MODE=0
-}
-deploy_reality_v4() { deploy_vless_reality_unified v4; }
-deploy_reality_v6() { deploy_vless_reality_unified v6; }
 
-egress_menu() {
-  local c; while true; do title '出站与穿透'; printf ' 1 Cloudflare WARP\n 2 Cloudflare Tunnel\n 0 返回\n'; read_menu_choice c '请选择: ' || return 0; case $c in 1) run_menu_action warp_menu;; 2) run_menu_action cf_tunnel_menu;; 0) return 0;; '') :;; *) warn '无效选择';; esac; done
+# ---------------------------------------------------------------------------
+# 网络快照: 公网 IP + IPv4/IPv6 可用性探测, 一起缓存 300 秒, 菜单重绘不联网
+# 缓存文件 5 行: 时间戳 / v4 / v6 / v4可用(0|1) / v6可用(0|1) (旧版 3 行缓存自动重测)
+# ---------------------------------------------------------------------------
+NET_V4=""; NET_V6=""; NET_V4OK=0; NET_V6OK=0
+net_snapshot() {
+  local now t="" v4="" v6="" o4="" o6="" tmp
+  now=$(date +%s)
+  if [[ -f $IP_CACHE_FILE ]]; then
+    { read -r t; read -r v4; read -r v6; read -r o4; read -r o6; } <"$IP_CACHE_FILE" || true
+    if [[ $t =~ ^[0-9]+$ ]] && (( now - t < 300 )) && [[ $o4 == [01] && $o6 == [01] ]]; then
+      NET_V4=$v4; NET_V6=$v6; NET_V4OK=$o4; NET_V6OK=$o6
+      return 0
+    fi
+  fi
+  NET_V4=""; NET_V6=""; NET_V4OK=0; NET_V6OK=0
+  if check_ipv4_egress; then NET_V4OK=1; NET_V4=$(detect_public_ip || true); fi
+  if check_ipv6_egress; then NET_V6OK=1; NET_V6=$(detect_public_ipv6 || true); fi
+  tmp=$(mktemp)
+  printf '%s\n%s\n%s\n%s\n%s\n' "$now" "$NET_V4" "$NET_V6" "$NET_V4OK" "$NET_V6OK" >"$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$IP_CACHE_FILE" 2>/dev/null || rm -f "$tmp"
+  return 0
 }
-diagnostics_menu() {
-  local c; while true; do title '诊断与测速'; printf ' 1 系统健康检查\n 2 系统诊断\n 3 节点对账 (reconcile)\n 4 运行日志\n 5 服务器测速\n 6 服务状态\n 0 返回\n'; read_menu_choice c '请选择: ' || return 0; case $c in 1) run_menu_action health_check;; 2) run_menu_action run_diagnostics;; 3) run_menu_action reconcile_nodes;; 4) run_menu_action show_logs;; 5) run_menu_action run_speedtest;; 6) run_menu_action show_status;; 0) return 0;; '') :;; *) warn '无效选择';; esac; done
+
+# 服务器国旗缓存 1 天 (避免每次快速部署都联网)
+get_cached_flag() {
+  local f="${STATE_DIR}/flag_cache" now t="" flag=""
+  now=$(date +%s)
+  if [[ -f $f ]]; then
+    { read -r t; read -r flag; } <"$f" || true
+    if [[ $t =~ ^[0-9]+$ ]] && (( now - t < 86400 )) && [[ -n $flag ]]; then printf '%s' "$flag"; return 0; fi
+  fi
+  flag=$(ui_run_cap "识别服务器地区" get_server_flag)
+  [[ -n $flag ]] || flag="🌐"
+  printf '%s\n%s\n' "$now" "$flag" >"$f" 2>/dev/null || true
+  printf '%s' "$flag"
+}
+
+
+# ---------------------------------------------------------------------------
+# 品牌: LINONO 字样 (三档) + 徽标 (固定调色板 + 四分块字符预渲染)
+#   徽标数据: 每格 2 字符 (前景色/背景色/掩码 打包, base32) 行间以 ':' 分隔;
+#   半块后备版每格 1 字符 (上/下色, base64 字母表)。运行时不依赖任何图像工具。
+# ---------------------------------------------------------------------------
+readonly LOGO_QB='vgvgvgvgvgvgvgvgvgvgvgvgvg3o3u3v3lvgvgvgvgvgvgvg:vgvgvgvgvgvgvgvgvg3s3s3u3v3v3n3hbobsbsbsbsbsbsvg:vgvgvgvgvgvgvgno2s2u3v3v3v467hfivgvgvgvgbibv9jbv:vgvgvgbobsbnbh3u3v3v0n0j7v7hvgvgvgvgvgjohtebfnfh:bobsbvbjvgvg3o3v0n4e7v0s0uvgvgvgjojsjujjjjjhvgvg:9n9jvgvgvg3o3v4e7v470u3jvgjojsjsjsjsjsjsjsjsjsjs:jrjvjvjsjk0j7v6763fsecfsjvjvjvijijijijijijirjjvg:vgjijjh7h7acaebvanlcejejnvnvnvnvnvnvnvnjnjvgvgvg:vgvgvgvgvgvgnjnjnrnvnvnvnvnvnnnjnhvgvgvgvgvgvgvg'
+readonly LOGO_QS='vgvgvgvgvgvgvgno3s3u3nvgvgvgvgvg:vgvgvgvgvg3o2t3v0n0rvgvgbjbjbvbt:vgbobsbi3o3v0n0j7nvgvgvgjojse3fh:bu9jvg3o0n4e473vvgvgvgjjjhvgvgvg:jijvjsgt63539kedijijijijijijjjvg:vgvgvgbjbjnrnvnvnvnnnjnjvgvgvgvg'
+readonly LOGO_HB='_____________UU0________:_________UU0000__WWWWWW_:________EE0001_v____niji:___WWi_000119f_____YYsr_:_Win___009980___YYADD___:ik____019907_YYYYYYYYYYY:DAAY_19ccYzYAAABBBBBBBD_:__DAyyyillttJJJJJJJLL___:______LLJJJJJJLLL_______'
+readonly LOGO_HS='________U07_____:_____Z0007__nniW:_WWn_0019___YYv_:ik__0180___D____:DAYYcazBBBBBBBD_:___nnJJJJJLL____'
+readonly -a BANNER_BIG=(
+  '██╗     @██╗@███╗   ██╗@ ██████╗ @███╗   ██╗@ ██████╗'
+  '██║     @██║@████╗  ██║@██╔═══██╗@████╗  ██║@██╔═══██╗'
+  '██║     @██║@██╔██╗ ██║@██║   ██║@██╔██╗ ██║@██║   ██║'
+  '██║     @██║@██║╚██╗██║@██║   ██║@██║╚██╗██║@██║   ██║'
+  '███████╗@██║@██║ ╚████║@╚██████╔╝@██║ ╚████║@╚██████╔╝'
+  '╚══════╝@╚═╝@╚═╝  ╚═══╝@ ╚═════╝ @╚═╝  ╚═══╝@ ╚═════╝'
+)
+readonly -a BANNER_COMP=(
+  '█   @▀█▀ @█▄ █ @█▀█ @█▄ █ @█▀█'
+  '█▄▄ @▄█▄ @█ ▀█ @█▄█ @█ ▀█ @█▄█'
+)
+readonly -a BANNER_ASCII=(
+  ' _     ___ _   _  ___  _   _  ___ '
+  '| |   |_ _| \ | |/ _ \| \ | |/ _ \'
+  '| |    | ||  \| | | | |  \| | | | |'
+  '| |___ | || |\  | |_| | |\  | |_| |'
+  '|_____|___|_| \_|\___/|_| \_|\___/'
+)
+readonly -a LOGO_RGB=("42;123;246" "10;79;214" "242;65;42" "245;124;20" "251;191;15" "20;168;68" "7;140;58")
+readonly -a LOGO_C256=(33 26 202 208 214 35 29)
+readonly -a LOGO_C16=(94 34 91 33 93 92 32)
+readonly -a LOGO_QCH=(" " "▘" "▝" "▀" "▖" "▌" "▞" "▛" "▗" "▚" "▐" "▜" "▄" "▙" "▟" "█")
+readonly LOGO_A32="0123456789abcdefghijklmnopqrstuv"
+readonly LOGO_A64="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+
+# 把一行 '@' 分段的字样按字母着色输出 (无颜色时 UI_LC 为空串, 自然降级)
+ui_brand_line() {
+  local line=$1 i out="" seg
+  local -a segs=()
+  IFS='@' read -ra segs <<<"$line"
+  for i in "${!segs[@]}"; do
+    seg=${segs[i]}
+    if (( i < 6 )); then out+="${UI_LC[i]}${BOLD}${seg}${NC}"; else out+=$seg; fi
+  done
+  printf '%s' "$out"
+}
+
+ui_brand() {   # 一行 LINONO (标题栏用)
+  local i l=(L I N O N O)
+  for i in 0 1 2 3 4 5; do printf '%s%s%s' "${UI_LC[i]}${BOLD}" "${l[i]}" "$NC"; done
+}
+
+# 按宽度选择字样: >=60 大号, >=30 紧凑两行, 更窄单行; 非 UTF-8 用纯 ASCII 版
+ui_banner() {
+  local cols=$1 line
+  if (( ! UI_UTF8 )); then
+    if (( cols >= 40 )); then
+      for line in "${BANNER_ASCII[@]}"; do printf ' %s\n' "$line"; done
+    elif (( cols >= 22 )); then printf ' |linono * singbox vps\n'
+    else printf ' ln> linono\n'; fi
+    return 0
+  fi
+  if (( cols >= 60 )); then
+    for line in "${BANNER_BIG[@]}"; do printf ' %s\n' "$(ui_brand_line "$line")"; done
+  elif (( cols >= 30 )); then
+    for line in "${BANNER_COMP[@]}"; do printf ' %s\n' "$(ui_brand_line "$line")"; done
+  elif (( cols >= 22 )); then
+    printf ' %s▌%slinono · singbox vps\n' "${UI_LC[2]}" "$NC"
+  else
+    printf ' ln› linono\n'
+  fi
+  return 0
+}
+
+# 把徽标解码到 UI_LOGO_ROWS (每行已含转义码) 与 UI_LOGO_W; 不满足降级条件返回 1
+UI_LOGO_ROWS=(); UI_LOGO_W=0
+ui_logo_build() {
+  local size=$1 mode=quad data row i n t cell hi lo v fg bg m top bot ch seq fgc bgc
+  UI_LOGO_ROWS=(); UI_LOGO_W=0
+  (( UI_COLOR && UI_UTF8 )) || return 1
+  # 四分块字符在个别旧终端 (Linux 控制台 / vt 系列) 有细缝: 退回半块字符版
+  if [[ ${SB_LOGO_HALF:-0} == 1 || ${TERM:-} == linux || ${TERM:-} == vt* ]]; then mode=half; fi
+  case $mode:$size in
+    quad:big) data=$LOGO_QB ;; quad:small) data=$LOGO_QS ;;
+    half:big) data=$LOGO_HB ;; *) data=$LOGO_HS ;;
+  esac
+  local -a rows=()
+  IFS=':' read -ra rows <<<"$data"
+  for row in "${rows[@]}"; do
+    local out=""
+    if [[ $mode == quad ]]; then
+      n=${#row}
+      for ((i=0; i<n; i+=2)); do
+        t=${LOGO_A32%%"${row:i:1}"*}; hi=${#t}
+        t=${LOGO_A32%%"${row:i+1:1}"*}; lo=${#t}
+        v=$(( hi*32 + lo )); fg=$(( (v>>7)&7 )); bg=$(( (v>>4)&7 )); m=$(( v&15 ))
+        if (( fg == 7 || m == 0 )); then out+=" "; continue; fi
+        ui_logo_code fg "$fg"; fgc=$UI_LCODE
+        seq=$'\033['"$fgc"
+        if (( bg != 7 )); then ui_logo_code bg "$bg"; seq+=";$UI_LCODE"; fi
+        out+="${seq}m${LOGO_QCH[m]}"$'\033[0m'
+      done
+      UI_LOGO_W=$(( n/2 ))
+    else
+      n=${#row}
+      for ((i=0; i<n; i++)); do
+        t=${LOGO_A64%%"${row:i:1}"*}; v=${#t}
+        top=$(( (v>>3)&7 )); bot=$(( v&7 ))
+        if (( top == 7 && bot == 7 )); then out+=" "; continue; fi
+        if (( top == 7 )); then ch="▄"; ui_logo_code fg "$bot"; seq=$'\033['"$UI_LCODE"
+        elif (( bot == 7 )); then ch="▀"; ui_logo_code fg "$top"; seq=$'\033['"$UI_LCODE"
+        elif (( top == bot )); then ch="█"; ui_logo_code fg "$top"; seq=$'\033['"$UI_LCODE"
+        else ch="▀"; ui_logo_code fg "$top"; seq=$'\033['"$UI_LCODE"; ui_logo_code bg "$bot"; seq+=";$UI_LCODE"; fi
+        out+="${seq}m${ch}"$'\033[0m'
+      done
+      UI_LOGO_W=$n
+    fi
+    UI_LOGO_ROWS+=("$out")
+  done
+  return 0
+}
+
+# ui_logo_code <fg|bg> <调色板序号 0-6> -> UI_LCODE (真彩 / 256 色量化 / 16 色)
+UI_LCODE=""
+ui_logo_code() {
+  local kind=$1 k=$2 base
+  if (( UI_TRUECOLOR )); then
+    if [[ $kind == fg ]]; then UI_LCODE="38;2;${LOGO_RGB[k]}"; else UI_LCODE="48;2;${LOGO_RGB[k]}"; fi
+  elif (( UI_256 )); then
+    if [[ $kind == fg ]]; then UI_LCODE="38;5;${LOGO_C256[k]}"; else UI_LCODE="48;5;${LOGO_C256[k]}"; fi
+  else
+    base=${LOGO_C16[k]}
+    if [[ $kind == fg ]]; then UI_LCODE=$base; else UI_LCODE=$(( base + 10 )); fi
+  fi
+}
+
+# 可选: 终端支持图片协议且用户提供了 PNG (SB_LOGO_PNG=/path/logo.png) 时显示原图
+ui_logo_image() {
+  local png=${SB_LOGO_PNG:-} b64 chunk first=1
+  [[ -n $png && -r $png && -t 1 ]] || return 1
+  b64=$(base64 -w0 "$png" 2>/dev/null) || return 1
+  if [[ ${TERM_PROGRAM:-} == iTerm.app || ${TERM_PROGRAM:-} == WezTerm ]]; then
+    printf '\033]1337;File=inline=1;width=24;preserveAspectRatio=1:%s\a\n' "$b64"
+    return 0
+  fi
+  if [[ -n ${KITTY_WINDOW_ID:-} || ${TERM:-} == xterm-kitty ]]; then
+    while [[ -n $b64 ]]; do
+      chunk=${b64:0:4096}; b64=${b64:4096}
+      local more=0; [[ -n $b64 ]] && more=1
+      if (( first )); then printf '\033_Ga=T,f=100,c=24,m=%d;%s\033\\' "$more" "$chunk"; first=0
+      else printf '\033_Gm=%d;%s\033\\' "$more" "$chunk"; fi
+    done
+    printf '\n'
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# 状态收集 (一次 systemctl is-active + 一次 jq) 与标题栏
+# ---------------------------------------------------------------------------
+UI_ST_INST=0; UI_ST_RUN=0; UI_ST_VER=""; UI_ST_NODES=0; UI_VER_CACHE=""
+ui_status_collect() {
+  UI_ST_INST=0; UI_ST_RUN=0; UI_ST_NODES=0
+  if command -v sing-box >/dev/null 2>&1; then
+    UI_ST_INST=1
+    if systemctl is-active --quiet sing-box 2>/dev/null; then UI_ST_RUN=1; fi
+    if [[ -z $UI_VER_CACHE ]]; then
+      UI_VER_CACHE=$(sing-box version 2>/dev/null | awk 'NR==1{print $3}' || true)
+    fi
+    UI_ST_VER=$UI_VER_CACHE
+  fi
+  if [[ -f $STATE_FILE ]]; then
+    UI_ST_NODES=$(jq '.connections | length' "$STATE_FILE" 2>/dev/null || true)
+    [[ $UI_ST_NODES =~ ^[0-9]+$ ]] || UI_ST_NODES=0
+  fi
+  net_snapshot
+}
+
+# 状态文字: 设置 UI_ST_DOT / UI_ST_COL / UI_ST_TXT
+ui_status_text() {
+  if (( ! UI_ST_INST )); then UI_ST_DOT=$G_OFF; UI_ST_COL=$YELLOW; UI_ST_TXT="未安装"
+  elif (( UI_ST_RUN )); then UI_ST_DOT=$G_DOT; UI_ST_COL=$GREEN; UI_ST_TXT="运行中 ${UI_ST_VER}"
+  else UI_ST_DOT=$G_OFF; UI_ST_COL=$RED; UI_ST_TXT="未运行"; fi
+}
+
+ui_addr_text() {   # 设置 UI_A4 / UI_A6 (纯文本)
+  if (( NET_V4OK )); then UI_A4="v4 ${NET_V4:-可用}"; else UI_A4="v4 ${G_SKIP}"; fi
+  if (( NET_V6OK )); then UI_A6="v6 ${NET_V6:-可用}"; else UI_A6="v6 ${G_SKIP}"; fi
+}
+
+ui_status_line() {
+  local cols plain head addr a6
+  cols=$(ui_cols)
+  ui_status_collect
+  ui_status_text; ui_addr_text
+  plain="LINONO ${G_H} ${UI_ST_DOT} ${UI_ST_TXT}  节点 ${UI_ST_NODES}  ${UI_A4}  ${UI_A6}"
+  ui_wv "$plain"
+  head="$(ui_brand) ${DIM}${G_H}${NC} ${UI_ST_COL}${UI_ST_DOT}${NC} ${UI_ST_TXT}  节点 ${BOLD}${UI_ST_NODES}${NC}"
+  if (( UI_WV <= cols )); then
+    printf '%s  %sv4%s%s  %sv6%s%s\n' "$head" "$DIM" "$NC" "${UI_A4#v4}" "$DIM" "$NC" "${UI_A6#v6}"
+  else
+    a6=$(ui_trunc "${UI_A6#v6 }" $(( cols - 22 > 8 ? cols - 22 : 8 )))
+    printf '%s\n  %sv4%s%s  %sv6%s %s\n' "$head" "$DIM" "$NC" "${UI_A4#v4}" "$DIM" "$NC" "$a6"
+  fi
+  return 0
+}
+
+# 启动画面 (进入交互菜单的第一次显示): 左徽标, 右紧凑字样 + 版本 + 状态 + 地址
+ui_splash() {
+  local cols size sub i n
+  local -a right=() comp=()
+  cols=$(ui_cols)
+  ui_status_collect; ui_status_text; ui_addr_text
+  size=big; if (( cols < 60 )); then size=small; fi
+  sub="singbox VPS 双栈智能管理 v${SCRIPT_VERSION}"
+  if (( cols < 50 )); then sub="singbox VPS v${SCRIPT_VERSION}"; fi
+  if (( cols >= 36 )) && { ui_logo_image || ui_logo_build "$size"; }; then
+    if (( ${#UI_LOGO_ROWS[@]} == 0 )); then   # 已显示原图: 文字放在图下方
+      ui_banner "$cols"
+      printf ' %s%s%s\n' "$BOLD" "$sub" "$NC"
+      printf ' %s%s%s %s\n' "$UI_ST_COL" "$UI_ST_DOT" "$NC" "$UI_ST_TXT  节点 ${UI_ST_NODES}"
+      printf ' %s\n %s\n\n' "$UI_A4" "$UI_A6"
+      return 0
+    fi
+    if (( cols - UI_LOGO_W - 2 >= 26 )); then
+      comp[0]=$(ui_brand_line "${BANNER_COMP[0]}"); comp[1]=$(ui_brand_line "${BANNER_COMP[1]}")
+    else   # 右侧放不下紧凑字样: 退为一行 LINONO
+      comp[0]=$(ui_brand); comp[1]=""
+    fi
+    n=${#UI_LOGO_ROWS[@]}
+    if (( n >= 9 )); then
+      right=("" "${comp[0]}" "${comp[1]}" "" "${BOLD}${sub}${NC}" "" \
+        "${UI_ST_COL}${UI_ST_DOT}${NC} ${UI_ST_TXT}  节点 ${BOLD}${UI_ST_NODES}${NC}" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}")
+    else
+      right=("${comp[0]}" "${comp[1]}" "${BOLD}${sub}${NC}" \
+        "${UI_ST_COL}${UI_ST_DOT}${NC} ${UI_ST_TXT}  节点 ${BOLD}${UI_ST_NODES}${NC}" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}")
+    fi
+    printf '\n'
+    for ((i=0; i<n; i++)); do
+      printf '%s  %s\n' "${UI_LOGO_ROWS[i]}" "${right[i]:-}"
+    done
+    printf '\n'
+    return 0
+  fi
+  # 无徽标 (非 UTF-8 / 非终端 / NO_COLOR / 过窄): 只显示字样
+  printf '\n'
+  ui_banner "$cols"
+  printf ' %s%s%s\n' "$BOLD" "$sub" "$NC"
+  printf ' %s%s%s %s  节点 %s\n' "$UI_ST_COL" "$UI_ST_DOT" "$NC" "$UI_ST_TXT" "$UI_ST_NODES"
+  printf ' %s  %s\n\n' "$UI_A4" "$UI_A6"
+  return 0
+}
+
+
+# ===========================================================================
+# 数据驱动菜单: 渲染 / 分发 / 帮助文本 全部由这一张表生成
+#   字段: 类型|分组|编号|小节|标题|说明|函数(可带参数)|CLI 命令名|标志
+#   类型: G=一级菜单项  I=二级菜单项   编号 '-' = 不出现在菜单, 仅保留 CLI
+#   标志: M=在主 shell 内运行 (自带循环的子菜单)  P=成功后停住等回车 (只读输出)
+#         N=CLI 下不持有互斥锁 (只读命令)   S=醒目标记 (★)
+#   约定: 字段内不得出现 '|'; CLI 为 '-' 表示没有对应命令行子命令
+# ===========================================================================
+readonly -a SB_MENU=(
+  "G|1|1||新建节点|快速部署 / 14 种协议|ui_group_menu 1|-|M"
+  "G|2|2||节点列表|查看 / 二维码 / 编辑 / 删除|node_list_menu|nodes|M"
+  "G|3|3||订阅与分发|Base64 / Clash / sing-box|subscription_menu|sub|"
+  "G|4|4||出站与穿透|WARP / Cloudflare Tunnel|ui_group_menu 4|-|M"
+  "G|5|5||诊断与测速|体检 / 对账 / 日志 / 测速|ui_group_menu 5|-|M"
+  "G|6|6||系统维护|证书 / BBR / 备份 / 升级|ui_group_menu 6|-|M"
+  "I|1|1||快速部署 VLESS Reality|全部默认值, 回车即完成|deploy_quick_reality|quick|S"
+  "I|1|2|Reality|Reality 自定义||deploy_vless_reality_unified|-|"
+  "I|1|3|Reality|Reality gRPC||deploy_vless_reality_grpc|reality-grpc|"
+  "I|1|4|Reality|ShadowTLS v3 + SS2022||deploy_shadowtls_ss2022|shadowtls|"
+  "I|1|5|无需域名|Shadowsocks 2022 [UDP]||deploy_shadowsocks|ss|"
+  "I|1|6|无需域名|Snell [需 sing-box ≥ 1.14]||deploy_snell|snell|"
+  "I|1|7|需要域名 + 证书|Trojan||deploy_trojan|trojan|"
+  "I|1|8|需要域名 + 证书|VLESS TLS||deploy_vless|vless|"
+  "I|1|9|需要域名 + 证书|Hysteria2 [UDP]||deploy_hysteria2|hy2|"
+  "I|1|10|需要域名 + 证书|TUIC v5 [UDP]||deploy_tuic|tuic|"
+  "I|1|11|需要域名 + 证书|AnyTLS||deploy_anytls|anytls|"
+  "I|1|12|需要域名 + 证书|NaiveProxy||deploy_naive|naive|"
+  "I|1|13|穿透|Cloudflare Tunnel + VLESS WS||deploy_cloudflare_tunnel|-|"
+  "I|4|1||Cloudflare WARP|出站 WARP 管理|warp_menu|warp|"
+  "I|4|2||Cloudflare Tunnel 管理|新建 / 状态 / 日志 / 重启 / 卸载|cf_tunnel_menu|cftunnel|"
+  "I|4|3||升级 cloudflared|检查 / 升级版本|upgrade_cloudflared|cf-upgrade|"
+  "I|5|1||服务状态与网络栈|systemd 状态 / 监听 / 公网 IP|show_status|status|PN"
+  "I|5|2||运行日志|sing-box 最近 150 行|show_logs|logs|PN"
+  "I|5|3||校验配置并重启|sing-box check + restart|validate_and_restart|check|"
+  "I|5|4||系统健康检查|服务 / WARP / 出站规则|health_check|health|PN"
+  "I|5|5||系统诊断|端口 / DNS / BBR / 防火墙 / 配置|run_diagnostics|diag|PN"
+  "I|5|6||检查并修复孤儿节点|对账 config 与连接记录 (reconcile)|reconcile_nodes|reconcile|"
+  "I|5|7||服务器测速|延迟 / 下载 / 上传|run_speedtest|speedtest|P"
+  "I|6|1||证书管理|到期查看 / 立即续期|cert_management_menu|certs|"
+  "I|6|2||启用 BBR|拥塞控制|enable_bbr|bbr|"
+  "I|6|3||恢复配置备份|回滚到最近一次备份|restore_backup|rollback|"
+  "I|6|4||安装 / 修复 sing-box 环境|官方 APT 源|install_sing_box|install|"
+  "I|6|5||更新 sing-box 核心|apt 升级|upgrade_sing_box|upgrade|"
+  "I|6|6||更新本脚本|从 GitHub 拉取|update_manager|self-update|"
+  "I|6|7||卸载 sing-box|保留配置与数据|uninstall_sing_box|uninstall|"
+  "I|6|8||彻底清除|软件包+配置+证书+防火墙, 不可逆|purge_all|purge|"
+  "I|0|-||部署 VLESS Reality (双栈)||deploy_vless_reality_unified dual|reality-dual|"
+  "I|0|-||部署 VLESS Reality (仅 IPv4)||deploy_vless_reality_unified v4|reality-v4|"
+  "I|0|-||部署 VLESS Reality (仅 IPv6)||deploy_vless_reality_unified v6|reality-v6|"
+  "I|0|-||查看客户端连接串||show_connections|links|PN"
+  "I|0|-||查看节点二维码||show_connection_qrcode|qrcode|"
+  "I|0|-||删除入站节点||remove_inbound|remove|"
+  "I|0|-||编辑节点 (改名/端口/地址/域名)||node_edit_menu|edit|"
+)
+
+R_FUNC=""; R_FLAGS=""; MENU_INT=0; INT_COUNT=0; SEL_TAG=""; MENU_LVL=sub
+
+# 提示符处按 Ctrl+C: 注意 `read -e` 收到被 trap 的 SIGINT 后不会自行返回, 必须在 trap 内
+# `return` 才能跳出当前菜单函数。主菜单需连按两次才退出; 子菜单/子提示直接回上一级。
+UI_INT_TRAP='if ui_int_hit; then return 0; fi'
+ui_int_hit() {
+  MENU_INT=1
+  if [[ $MENU_LVL == main ]]; then
+    INT_COUNT=$((INT_COUNT+1))
+    if (( INT_COUNT >= 2 )); then printf '\n'; exit 0; fi
+    printf '\n'; warn "再按一次 Ctrl+C 或输入 0 退出"; printf '选择 [0-6]: '
+    return 1
+  fi
+  printf '\n'
+  return 0
+}
+
+# 按 CLI 命令名查表 -> R_FUNC / R_FLAGS
+ui_cli_row() {
+  local row kind grp num sect title desc func cli flags
+  for row in "${SB_MENU[@]}"; do
+    IFS='|' read -r kind grp num sect title desc func cli flags <<<"$row"
+    if [[ $cli == "$1" ]]; then R_FUNC=$func; R_FLAGS=$flags; return 0; fi
+  done
+  return 1
+}
+
+# 按 分组 + 菜单编号 查表 (kind 为 I) -> R_FUNC / R_FLAGS
+ui_find_item() {
+  local row kind grp num sect title desc func cli flags
+  for row in "${SB_MENU[@]}"; do
+    IFS='|' read -r kind grp num sect title desc func cli flags <<<"$row"
+    if [[ $kind == I && $grp == "$1" && $num == "$2" ]]; then R_FUNC=$func; R_FLAGS=$flags; return 0; fi
+  done
+  return 1
+}
+ui_find_group() {
+  local row kind grp num sect title desc func cli flags
+  for row in "${SB_MENU[@]}"; do
+    IFS='|' read -r kind grp num sect title desc func cli flags <<<"$row"
+    if [[ $kind == G && $num == "$1" ]]; then R_FUNC=$func; R_FLAGS=$flags; return 0; fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# 动作隔离: 每个菜单动作在子 shell 中运行, die/失败只终止该动作, 不退出菜单。
+# 关键点: 不能写成 `( ... ) || ...` 或放进 if —— 那会让子 shell 内的 set -e / ERR 失效。
+# 做法: 父 shell 临时 set +e 并摘掉 ERR trap, 子 shell 内重新 set -Ee + ERR trap。
+# ---------------------------------------------------------------------------
+action_interrupt() {
+  trap - INT
+  if [[ -n ${UI_BG_PID:-} ]]; then kill "$UI_BG_PID" 2>/dev/null || true; fi
+  printf '\r\033[K\n' >&2
+  if [[ -n $PENDING_TAG ]]; then
+    warn "节点 [${PENDING_TAG}] 可能已写入并生效, 但连接记录/防火墙可能未完成。请运行: sb reconcile" || true
+  fi
+  exit 130
+}
+
+run_action() {
+  local flags=$1 rc=0
+  shift
+  MENU_INT=0
+  set +e
+  trap - ERR
+  trap 'MENU_INT=1' INT        # 动作运行期间父 shell 不响应 Ctrl+C (由子 shell 自行处理)
+  (
+    set -Ee
+    trap 'on_error $LINENO' ERR
+    trap 'action_interrupt' INT
+    "$@"
+  )
+  rc=$?
+  set -e
+  trap 'on_error $LINENO' ERR
+  trap "$UI_INT_TRAP" INT
+  UI_VER_CACHE=""
+  if (( rc == 0 )); then
+    if [[ $flags == *P* ]]; then ui_pause "── 按回车返回菜单 ──"; fi
+  elif (( rc == 130 )); then
+    warn "本次操作已取消, 返回菜单。"
+  else
+    warn "本次操作未完成，按回车返回菜单（不会退出脚本）"
+    ui_pause ""
+  fi
+  return 0
+}
+
+# 执行一行菜单: M 标志在主 shell 内运行, 其余走 run_action
+ui_exec_row() {
+  local func=$1 flags=$2
+  local -a cmd=()
+  IFS=' ' read -ra cmd <<<"$func"
+  if [[ $flags == *M* ]]; then "${cmd[@]}"; else run_action "$flags" "${cmd[@]}"; fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 渲染
+# ---------------------------------------------------------------------------
+ui_main_draw() {
+  local cols row kind grp num sect title desc func cli flags
+  cols=$(ui_cols)
+  printf '\n'
+  ui_status_line
+  ui_hr
+  for row in "${SB_MENU[@]}"; do
+    IFS='|' read -r kind grp num sect title desc func cli flags <<<"$row"
+    [[ $kind == G ]] || continue
+    printf ' %s%2s%s  %s%s%s' "$CYAN" "$num" "$NC" "$BOLD" "$(ui_pad "$title" 12)" "$NC"
+    if (( cols >= 60 )); then printf '%s%s%s' "$DIM" "$desc" "$NC"; fi
+    printf ' %s%s%s\n' "$DIM" "$G_ARR" "$NC"
+  done
+  printf ' %s 0  退出%s\n' "$DIM" "$NC"
+  return 0
+}
+
+ui_group_draw() {
+  local grp=$1 cols row kind g num sect title desc func cli flags last="" linew=0 cw
+  local line="" cell cellc gtitle="" star
+  cols=$(ui_cols)
+  ui_find_group "$grp" || true
+  for row in "${SB_MENU[@]}"; do
+    IFS='|' read -r kind g num sect title desc func cli flags <<<"$row"
+    if [[ $kind == G && $num == "$grp" ]]; then gtitle=$title; fi
+  done
+  printf '\n%s%s%s %s %s%s%s\n' "${BOLD}${CYAN}" "$G_H" "$G_H" "$gtitle" "$G_H" "$G_H" "$NC"
+  for row in "${SB_MENU[@]}"; do
+    IFS='|' read -r kind g num sect title desc func cli flags <<<"$row"
+    [[ $kind == I && $g == "$grp" && $num != - ]] || continue
+    if [[ $sect != "$last" ]]; then
+      if [[ -n $line ]]; then printf '%s\n' "$line"; line=""; linew=0; fi
+      if [[ -n $sect ]]; then printf ' %s%s %s %s%s\n' "$DIM" "$G_H" "$sect" "$G_H" "$NC"; fi
+      last=$sect
+    fi
+    star="  "; if [[ $flags == *S* ]]; then star="${YELLOW}${G_STAR}${NC} "; fi
+    if [[ -n $desc ]]; then
+      if [[ -n $line ]]; then printf '%s\n' "$line"; line=""; linew=0; fi
+      printf ' %s%s%2s%s  %s' "$star" "$CYAN" "$num" "$NC" "$BOLD"
+      if (( cols >= 60 )); then printf '%s%s  %s%s%s' "$(ui_pad "$title" 26)" "$NC" "$DIM" "$desc" "$NC"; else printf '%s%s' "$title" "$NC"; fi
+      printf '\n'
+    else
+      cell=$(printf '%2s  %s' "$num" "$title")
+      cellc=$(printf '%s%2s%s  %s' "$CYAN" "$num" "$NC" "$title")
+      ui_wv "$cell"; cw=$(( UI_WV + 3 ))
+      if (( linew > 0 && linew + cw > cols - 3 )); then printf '%s\n' "$line"; line=""; linew=0; fi
+      if [[ -z $line ]]; then line="  ${cellc}"; linew=$(( cw + 1 )); else line+="   ${cellc}"; linew=$(( linew + cw )); fi
+    fi
+  done
+  if [[ -n $line ]]; then printf '%s\n' "$line"; fi
+  printf ' %s 0  返回%s\n' "$DIM" "$NC"
+  return 0
+}
+
+# 二级菜单 (分类子菜单, 在主 shell 内循环; 每个动作经 run_action 隔离)
+ui_group_menu() {
+  local grp=$1 choice rc
+  while true; do
+    ui_group_draw "$grp"
+    rc=0; MENU_INT=0
+    read -e -r -p "选择: " choice || rc=$?
+    if (( rc != 0 )); then printf '\n'; return 0; fi        # Ctrl+D / Ctrl+C: 回上一级
+    choice=${choice//[[:space:]]/}
+    if [[ -z $choice ]]; then continue; fi
+    if [[ $choice == 0 ]]; then return 0; fi
+    if ui_find_item "$grp" "$choice"; then
+      ui_exec_row "$R_FUNC" "$R_FLAGS"
+    else
+      warn "无效选择: ${choice}"
+    fi
+  done
 }
 
 menu() {
-  local choice handler row n label desc fn
-  MENU_ACTIVE=1; MENU_INTERRUPT_COUNT=0
+  local choice rc
+  MENU_INT=0; INT_COUNT=0
+  trap "$UI_INT_TRAP" INT
+  ui_splash
   while true; do
-    print_main_menu
-    if ! read_menu_choice choice '请选择 [1-6, 0 退出]: '; then
-      if (( MENU_INTERRUPT_COUNT == 1 )); then continue; fi
-      MENU_ACTIVE=0; printf '\n'; return 0
+    ui_main_draw
+    rc=0; MENU_INT=0; MENU_LVL=main
+    read -e -r -p "选择 [0-6]: " choice || rc=$?
+    MENU_LVL=sub
+    if (( rc != 0 )); then printf '\n'; exit 0; fi      # Ctrl+D: 正常退出, 不触发 ERR trap
+    INT_COUNT=0
+    choice=${choice//[[:space:]]/}
+    if [[ -z $choice ]]; then continue; fi              # 直接回车: 静默重绘
+    if [[ $choice == 0 ]]; then exit 0; fi
+    if ui_find_group "$choice"; then
+      ui_exec_row "$R_FUNC" "$R_FLAGS"
+    else
+      warn "无效选择: ${choice}"
     fi
-    MENU_INTERRUPT_COUNT=0
-    [[ -z $choice ]] && continue
-    if [[ $choice == 0 ]]; then MENU_ACTIVE=0; return 0; fi
-    handler=''
-    for row in "${MAIN_MENU_ROWS[@]}"; do IFS='|' read -r n label desc fn <<< "$row"; if [[ $n == "$choice" ]]; then handler=$fn; break; fi; done
-    if [[ -z $handler ]]; then warn '无效的编号选择。'; continue; fi
-    run_menu_action "$handler"
   done
 }
 
-CLI_ROWS=(
-  'menu|menu|交互菜单'
-  'install|install_sing_box|安装或修复 sing-box'
-  'reality-dual|deploy_reality_dual_cli|VLESS Reality 双栈'
-  'reality-v4|deploy_reality_v4_cli|VLESS Reality IPv4'
-  'reality-v6|deploy_reality_v6_cli|VLESS Reality IPv6'
-  'reality-grpc|deploy_vless_reality_grpc|VLESS Reality gRPC'
-  'shadowtls|deploy_shadowtls_ss2022|ShadowTLS + SS2022'
-  'ss|deploy_shadowsocks|Shadowsocks 2022'
-  'trojan|deploy_trojan|Trojan TLS'
-  'vless|deploy_vless|VLESS TLS'
-  'hy2|deploy_hysteria2|Hysteria2'
-  'tuic|deploy_tuic|TUIC v5'
-  'anytls|deploy_anytls|AnyTLS'
-  'naive|deploy_naive|NaiveProxy'
-  'snell|deploy_snell|Snell v5/v6'
-  'cftunnel|cf_tunnel_menu|Cloudflare Tunnel'
-  'warp|warp_menu|Cloudflare WARP'
-  'sub|subscription_menu|订阅管理'
-  'speedtest|run_speedtest|服务器测速'
-  'links|show_connections|连接串'
-  'qrcode|show_connection_qrcode|节点二维码'
-  'remove|remove_inbound|删除节点'
-  'status|show_status|服务状态'
-  'logs|show_logs|运行日志'
-  'check|validate_and_restart|配置校验并重启'
-  'health|health_check|健康检查'
-  'diag|run_diagnostics|系统诊断'
-  'certs|cert_management_menu|证书管理'
-  'bbr|enable_bbr|启用 BBR'
-  'rollback|restore_backup|恢复配置备份'
-  'upgrade|upgrade_sing_box|升级 sing-box'
-  'cf-upgrade|upgrade_cloudflared|升级 cloudflared'
-  'self-update|update_manager|更新管理脚本'
-  'edit|node_edit_menu|编辑节点'
-  'reconcile|reconcile_nodes|节点对账'
-  'uninstall|uninstall_sing_box|卸载 sing-box'
-  'purge|purge_all|彻底清除'
-)
-deploy_reality_dual_cli() { deploy_vless_reality_unified dual; }
-deploy_reality_v4_cli() { deploy_vless_reality_unified v4; }
-deploy_reality_v6_cli() { deploy_vless_reality_unified v6; }
 usage() {
+  local row kind grp num sect title desc func cli flags
   printf '用法: sb [命令]\n\n'
-  local row cmd fn desc
-  for row in "${CLI_ROWS[@]}"; do IFS='|' read -r cmd fn desc <<< "$row"; printf '  %-16s %s\n' "$cmd" "$desc"; done
-  printf '\n'
-}
-main() {
-  local cmd=${1:-menu} row name fn desc
-  case $cmd in -h|--help|help) usage; return 0;; esac
-  require_root; ensure_dirs
-  exec {LOCK_FD}>"$LOCK_FILE"
-  flock -n "$LOCK_FD" || die "检测到另一个 sb 操作正在进行中，请稍后重试。"
-  for row in "${CLI_ROWS[@]}"; do
-    IFS='|' read -r name fn desc <<< "$row"
-    if [[ $cmd == "$name" ]]; then "$fn"; return $?; fi
+  printf '  %-14s %s\n' "menu" "交互菜单 (默认)"
+  for row in "${SB_MENU[@]}"; do
+    IFS='|' read -r kind grp num sect title desc func cli flags <<<"$row"
+    [[ -n $cli && $cli != - ]] || continue
+    if [[ -n $desc ]]; then printf '  %-14s %s — %s\n' "$cli" "$title" "$desc"; else printf '  %-14s %s\n' "$cli" "$title"; fi
   done
-  usage; return 1
+  printf '  %-14s %s\n' "help" "显示本帮助"
+  printf '\n环境变量: NO_COLOR=1 关闭颜色  SB_THEME=light 白底主题  SB_LOGO_HALF=1 徽标改用半块字符\n'
+  return 0
 }
 
-main "$@"
+main() {
+  local cmd=${1:-menu}
+  case $cmd in
+    -h|--help|help) if [[ -t 1 ]]; then ui_banner "$(ui_cols)"; fi; usage; return 0 ;;
+    -V|--version|version) printf 'sb %s\n' "$SCRIPT_VERSION"; return 0 ;;
+  esac
+  require_root
+  ensure_dirs
+  R_FUNC=""; R_FLAGS=""
+  if [[ $cmd != menu ]]; then
+    ui_cli_row "$cmd" || { usage; exit 1; }
+  fi
+  # 互斥锁: 菜单与写操作持有; 只读命令 (status/links/logs/health/diag, 表中 N 标志) 跳过,
+  # 这样菜单开着时仍可另开终端查看。进程退出时文件描述符关闭, 锁自动释放。
+  if [[ $R_FLAGS != *N* ]]; then
+    exec {LOCK_FD}>"$LOCK_FILE"
+    if ! flock -n "$LOCK_FD"; then
+      die "检测到另一个 sb 操作正在进行中 (锁文件: ${LOCK_FILE}), 请等待其结束后重试。"
+    fi
+  fi
+  if [[ $cmd == menu ]]; then
+    menu
+  else
+    local -a cmdline=()
+    IFS=' ' read -ra cmdline <<<"$R_FUNC"
+    "${cmdline[@]}"
+  fi
+}
 
 
+# ===========================================================================
+# 节点列表 (动作字母 + 编号) / 编辑菜单
+# ===========================================================================
+NL_N=0; NL_TYPE=(); NL_TAG=(); NL_PORT=(); NL_URI=()
+LISTEN_SET=""; LISTEN_OK=0
+declare -A INB_PORT=()
+
+ui_node_load() {
+  local type tag port uri
+  NL_TYPE=(); NL_TAG=(); NL_PORT=(); NL_URI=()
+  while IFS=$'\t' read -r type tag port uri; do
+    [[ -n $tag ]] || continue
+    NL_TYPE+=("$type"); NL_TAG+=("$tag"); NL_PORT+=("$port"); NL_URI+=("$uri")
+  done < <(jq -r '.connections[]? | [.type, .tag, (.port|tostring), .uri] | @tsv' "$STATE_FILE" 2>/dev/null)
+  NL_N=${#NL_TAG[@]}
+  return 0
+}
+
+# 监听快照: 一次 ss, 记成 " tcp:443 udp:443 " 形式
+ui_listen_snapshot() {
+  LISTEN_SET=""; LISTEN_OK=0
+  if command -v ss >/dev/null 2>&1; then
+    LISTEN_OK=1
+    LISTEN_SET=$(ss -H -tuln 2>/dev/null | awk '{n=split($5,a,":"); printf " %s:%s", $1, a[n]}' || true)
+    LISTEN_SET+=" "
+  fi
+  return 0
+}
+
+ui_inbound_ports() {
+  local tag port
+  INB_PORT=()
+  while IFS=$'\t' read -r tag port; do
+    [[ -n $tag ]] || continue
+    INB_PORT[$tag]=$port
+  done < <(jq -r '.inbounds[]? | [.tag, (.listen_port // "" | tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+  return 0
+}
+
+# 本机是否存在受本脚本管理的防火墙后端 (无后端时只需云厂商安全组, 显示 –)
+ui_fw_backend_present() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then return 0; fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then return 0; fi
+  if command -v iptables >/dev/null 2>&1; then return 0; fi
+  if command -v nft >/dev/null 2>&1 && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+proto_label() {
+  case $1 in
+    vless-reality-grpc*) printf 'Reality gRPC' ;;
+    vless-reality*)      printf 'Reality' ;;
+    shadowtls*)          printf 'ShadowTLS' ;;
+    shadowsocks*)        printf 'SS2022' ;;
+    trojan*)             printf 'Trojan' ;;
+    vless-tls*)          printf 'VLESS TLS' ;;
+    vless-ws-cloudflare-tunnel*) printf 'CF Tunnel' ;;
+    hysteria2*)          printf 'Hysteria2' ;;
+    tuic*)               printf 'TUIC v5' ;;
+    anytls*)             printf 'AnyTLS' ;;
+    naive*)              printf 'Naive' ;;
+    snell*)              printf 'Snell' ;;
+    *)                   printf '%s' "${1%%-*}" ;;
+  esac
+}
+
+# 取连接串 # 之后的显示名 (百分号解码, 并去掉控制字符防止终端转义注入)
+ui_uri_name() {
+  local frag=${1##*#}
+  [[ $1 == *'#'* ]] || { printf ''; return 0; }
+  frag=$(printf '%b' "${frag//%/\\x}")
+  printf '%s' "${frag//[[:cntrl:]]/}"
+}
+
+ui_node_table() {
+  local cols narrow=0 i type tag port label protos tp fw ls st fwc lsc name p active room
+  local fwpresent=0 anyfw=0 inb_ok hints=()
+  cols=$(ui_cols); if (( cols < 60 )); then narrow=1; fi
+  ui_listen_snapshot; ui_inbound_ports
+  if ui_fw_backend_present; then fwpresent=1; fi
+  active=0; if systemctl is-active --quiet sing-box 2>/dev/null; then active=1; fi
+  printf '
+'
+  if (( narrow )); then
+    printf '%s%s%s%s%s墙 听%s\n' "$BOLD" "$(ui_pad ' #' 4)" "$(ui_pad '状态' 5)" "$(ui_pad '协议' 13)" "$(ui_pad '端口' 13)" "$NC"
+  else
+    printf '%s%s%s%s%s%s%s名称%s\n' "$BOLD" "$(ui_pad ' #' 4)" "$(ui_pad '状态' 6)" "$(ui_pad '协议' 13)" "$(ui_pad '端口/传输' 13)" "$(ui_pad '防火墙' 8)" "$(ui_pad '监听' 6)" "$NC"
+  fi
+  ui_hr
+  for ((i=0; i<NL_N; i++)); do
+    type=${NL_TYPE[i]}; tag=${NL_TAG[i]}; port=${NL_PORT[i]}
+    label=$(proto_label "$type")
+    tp=""; fw=1; ls=1
+    if [[ $type == vless-ws-cloudflare-tunnel ]]; then
+      tp="${INB_PORT[$tag]:-$port}/tcp"
+      fw=2
+      if (( LISTEN_OK )); then [[ $LISTEN_SET == *" tcp:${INB_PORT[$tag]:-$port} "* ]] || ls=0; else ls=2; fi
+    else
+      protos=$(_proto_fw_protocols "$type")
+      for p in $protos; do
+        tp+="${tp:+/}${p}"
+        if (( fwpresent )); then _fw_port_allowed "$port" "$p" || fw=0; else fw=2; fi
+        if (( LISTEN_OK )); then [[ $LISTEN_SET == *" ${p}:${port} "* ]] || ls=0; else ls=2; fi
+      done
+      tp="${port}/${tp}"
+    fi
+    inb_ok=0; [[ -n ${INB_PORT[$tag]+x} ]] && inb_ok=1
+    if (( active && inb_ok )); then st="${GREEN}${G_DOT}${NC}"; else st="${RED}${G_OFF}${NC}"; fi
+    case $fw in 1) fwc="${GREEN}${G_OK}${NC}" ;; 0) fwc="${RED}${G_X}${NC}" ;; *) fwc="${DIM}${G_SKIP}${NC}" ;; esac
+    case $ls in 1) lsc="${GREEN}${G_OK}${NC}" ;; 0) lsc="${RED}${G_X}${NC}" ;; *) lsc="${DIM}${G_SKIP}${NC}" ;; esac
+    if (( narrow )); then
+      printf ' %s%-2d%s %s    %-12s %-12s %s %s\n' "$CYAN" $((i+1)) "$NC" "$st" "$(ui_trunc "$label" 12)" "$(ui_trunc "$tp" 12)" "$fwc" "$lsc"
+    else
+      room=$(( cols - 52 )); if (( room < 8 )); then room=8; fi
+      name=$(ui_trunc "$(ui_uri_name "${NL_URI[i]}")" "$room")
+      printf ' %s%-2d%s %s     %-12s %-12s %s       %s     %s\n' "$CYAN" $((i+1)) "$NC" "$st" "$label" "$tp" "$fwc" "$lsc" "$name"
+    fi
+    if (( fw == 0 )); then hints+=("$(printf '%s%s%s %d 防火墙未放行 %s  %s→%s %sf%d%s 修复防火墙' "$YELLOW" "$G_WARN" "$NC" $((i+1)) "$tp" "$DIM" "$NC" "$CYAN" $((i+1)) "$NC")"); fi
+    if (( ls == 0 )); then hints+=("$(printf '%s%s%s %d 未监听 %s  %s→%s %sl%d%s 查看日志' "$YELLOW" "$G_WARN" "$NC" $((i+1)) "$tp" "$DIM" "$NC" "$CYAN" $((i+1)) "$NC")"); fi
+  done
+  if (( ! fwpresent )); then printf '%s%s 未检测到本机防火墙, 仅需在云厂商安全组放行端口。%s\n' "$DIM" "$G_INFO" "$NC"; fi
+  if (( ${#hints[@]} > 0 )); then printf '\n'; printf '%s\n' "${hints[@]}"; fi
+  return 0
+}
+
+ui_node_qr() {
+  local idx=$1
+  printf '\n%s%s%s\n' "$BOLD" "${NL_TAG[idx]}" "$NC"
+  ui_show_uri "${NL_URI[idx]}"
+  show_qrcode "${NL_URI[idx]}" "${NL_TAG[idx]}"
+}
+
+fix_node_firewall() {
+  local idx=$1 type port proto
+  type=${NL_TYPE[idx]}; port=${NL_PORT[idx]}
+  if [[ $type == vless-ws-cloudflare-tunnel ]]; then info "Tunnel 节点监听本机回环, 无需放行防火墙。"; return 0; fi
+  for proto in $(_proto_fw_protocols "$type"); do open_firewall_port "$port" "$proto"; done
+  ok "已处理 ${NL_TAG[idx]} 的防火墙放行。"
+}
+
+show_node_logs() {
+  local tag=$1 out
+  out=$(journalctl -u sing-box -n 400 --no-pager -o cat 2>/dev/null | grep -F -- "$tag" | tail -n 60 || true)
+  if [[ -n $out ]]; then
+    printf '%s\n' "$out"
+  else
+    warn "最近日志中没有 [${tag}] 的记录, 以下为 sing-box 最近 40 行:"
+    journalctl -u sing-box -n 40 --no-pager -o cat || true
+  fi
+}
+
+node_list_menu() {
+  local act verb num idx tag rc
+  while true; do
+    ensure_dirs
+    ui_node_load
+    if (( NL_N == 0 )); then
+      warn "尚无节点记录, 请先在「新建节点」里部署。"
+      ui_pause "── 按回车返回菜单 ──"
+      return 0
+    fi
+    ui_node_table
+    printf '\n%sq%s 二维码  %sc%s 复制链接  %se%s 编辑  %sd%s 删除  %sf%s 修复防火墙  %sl%s 日志  %s0%s 返回\n' \
+      "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC"
+    rc=0; MENU_INT=0
+    read -e -r -p "操作 (如 e3): " act || rc=$?
+    if (( rc != 0 )); then printf '\n'; return 0; fi
+    act=${act//[[:space:]]/}
+    if [[ -z $act ]]; then continue; fi
+    if [[ $act == 0 ]]; then return 0; fi
+    if [[ $act =~ ^([qcedfl])([0-9]+)$ ]]; then
+      verb=${BASH_REMATCH[1]}; num=$((10#${BASH_REMATCH[2]}))
+    else
+      warn "无法识别的操作 “${act}”, 格式: 动作字母+编号, 如 e3 / q1 / d2"
+      continue
+    fi
+    if (( num < 1 || num > NL_N )); then warn "不存在的编号 ${num} (当前 1-${NL_N})。"; continue; fi
+    idx=$((num-1)); tag=${NL_TAG[idx]}
+    case $verb in
+      q) run_action P ui_node_qr "$idx" ;;
+      c) ui_copy "${NL_URI[idx]}" ;;
+      e) SEL_TAG=$tag; node_edit_menu; SEL_TAG="" ;;
+      d) run_action "" remove_inbound "$tag" ;;
+      f) run_action P fix_node_firewall "$idx" ;;
+      l) run_action P show_node_logs "$tag" ;;
+    esac
+  done
+}
 
 
+# 编辑菜单: 从节点列表进入 (SEL_TAG 已选定) 只做一次修改并回到列表; CLI 'sb edit' 保持原有循环菜单
+node_edit_menu() {
+  local choice type label4 fn4 rc=0
+  if [[ -n ${SEL_TAG:-} ]]; then
+    type=$(_conn_field "$SEL_TAG" type 2>/dev/null || true)
+    case $type in
+      vless-reality*|shadowtls*) label4="修改握手域名"; fn4=change_reality_domain ;;
+      *)                         label4="修改 TLS 域名"; fn4=change_tls_domain ;;
+    esac
+    title "编辑 ${SEL_TAG}"
+    printf '  %s1%s 重命名   %s2%s 修改端口   %s3%s 修改连接地址   %s4%s %s   %s0%s 返回\n' \
+      "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$label4" "$CYAN" "$NC"
+    read -e -r -p "请选择: " choice || rc=$?
+    if (( rc != 0 )); then printf '\n'; return 0; fi
+    case ${choice//[[:space:]]/} in
+      1) run_action "" rename_node ;;
+      2) run_action "" change_node_port ;;
+      3) run_action "" change_node_host ;;
+      4) run_action "" "$fn4" ;;
+      *) ;;
+    esac
+    return 0
+  fi
+  while true; do
+    title "编辑节点"
+    printf '  1) 重命名节点\n  2) 修改监听端口\n  3) 修改客户端连接地址\n  4) 修改握手域名 (Reality/ShadowTLS)\n  5) 修改 TLS 域名 (Trojan/VLESS TLS/Hy2/TUIC/AnyTLS)\n  0) 返回\n'
+    read -e -r -p '请选择: ' choice || return 0
+    case $choice in
+      1) rename_node ;;
+      2) change_node_port ;;
+      3) change_node_host ;;
+      4) change_reality_domain ;;
+      5) change_tls_domain ;;
+      0) return 0 ;;
+      *) warn "无效的编号选择。" ;;
+    esac
+  done
+}
+
+# ===========================================================================
+# 快速部署 VLESS Reality: 全部默认值, 回车即完成
+# ===========================================================================
+port_free_quiet() {
+  local port=$1
+  if port_is_used_in_config "$port"; then return 1; fi
+  if command -v ss >/dev/null 2>&1 && ss -tulnH "sport = :$port" 2>/dev/null | grep -q .; then return 1; fi
+  return 0
+}
+
+# 首选 443, 被占用则顺延到常见端口
+pick_free_port() {
+  local p n
+  for p in 443 8443 2053 2083 2087 2096 10443 20443; do
+    if port_free_quiet "$p"; then printf '%s' "$p"; return 0; fi
+  done
+  for n in 1 2 3 4 5 6 7 8 9 10; do
+    p=$(( RANDOM % 20000 + 20000 ))
+    if port_free_quiet "$p"; then printf '%s' "$p"; return 0; fi
+  done
+  die "找不到可用端口, 请手动指定。"
+}
+
+_tls13_probe() {
+  command -v openssl >/dev/null 2>&1 || return 0
+  timeout 4 openssl s_client -connect "${1}:443" -tls1_3 -servername "$1" </dev/null >/dev/null 2>&1
+}
+
+_quick_default_host() {   # <mode>
+  case $1 in
+    v4) printf '%s' "${NET_V4:-}" ;;
+    v6) printf '%s' "${NET_V6:-}" ;;
+    *)  if [[ -n $NET_V4 ]]; then printf '%s' "$NET_V4"; else printf '%s' "$NET_V6"; fi ;;
+  esac
+}
+
+deploy_quick_reality() {
+  local mode=dual port want=443 handshake host name tag flag ans tls13="" t0 t1
+  local listen outbound keypair private_key public_key short_id uuid reality tlsj inbound uri encname
+  title "快速部署 · VLESS Reality"
+  net_snapshot
+  host=$(_quick_default_host "$mode")
+  if [[ -z $host ]]; then host=$(hostname -I 2>/dev/null | awk '{print $1}' || true); fi
+  port=$(pick_free_port)
+  handshake=${REALITY_PRESET_DOMAINS[0]}
+  name="Reality-${mode}"
+  if UI_SOFT=1 ui_run "检测 ${handshake} 的 TLS 1.3" _tls13_probe "$handshake"; then tls13="${GREEN}TLS 1.3 ${G_OK}${NC}"; else tls13="${YELLOW}${G_WARN} 未能确认 TLS 1.3${NC}"; fi
+
+  while true; do
+    printf '\n%s%s%s\n' "$BOLD" "部署摘要" "$NC"
+    case $mode in dual) printf '  %-9s Dual 双栈 (v4 + v6)\n' "模式" ;; v4) printf '  %-9s 仅 IPv4\n' "模式" ;; *) printf '  %-9s 仅 IPv6 (严格)\n' "模式" ;; esac
+    if [[ $port != "$want" ]]; then
+      printf '  %-9s %s%s%s  %s%s %s 已被占用, 自动顺延%s\n' "端口" "$BOLD" "$port" "$NC" "$YELLOW" "$G_WARN" "$want" "$NC"
+    else
+      printf '  %-9s %s%s%s\n' "端口" "$BOLD" "$port" "$NC"
+    fi
+    printf '  %-9s %s  %s\n' "握手域名" "$handshake" "$tls13"
+    printf '  %-9s %s\n' "连接地址" "${host:-<未检测到, 请按 e 填写>}"
+    printf '  %-9s %s\n' "节点名" "$name"
+    read -e -r -p "回车 确认 / e 逐项修改 / 0 取消: " ans || die "输入已取消。"
+    case ${ans//[[:space:]]/} in
+      '') if [[ -z $host ]]; then warn "连接地址为空, 请先按 e 填写。"; continue; fi; break ;;
+      0)  warn "已取消。"; return 0 ;;
+      e|E)
+        mode=$(ask_node_network_mode)
+        host=$(ask_node_server "$mode")
+        port=$(ask_port "监听端口" "$port")
+        handshake=$(ask_reality_handshake_domain)
+        if UI_SOFT=1 ui_run "检测 ${handshake} 的 TLS 1.3" _tls13_probe "$handshake"; then tls13="${GREEN}TLS 1.3 ${G_OK}${NC}"; else tls13="${YELLOW}${G_WARN} 未能确认 TLS 1.3${NC}"; fi
+        while true; do
+          read -e -r -i "$name" -p "节点名称: " name || die "输入已取消。"
+          if [[ -n $name ]] && (( ${#name} <= 64 )); then break; fi
+          warn "节点名称不能为空且不超过 64 字符。"
+        done
+        want=$port
+        ;;
+      *) warn "未知输入 “${ans}”。" ;;
+    esac
+  done
+
+  tag="reality-${mode}-${port}"
+  check_and_handle_existing_tag "$tag" || return 0
+  ensure_port_available "$port"
+  listen=$(mode_listen_addr "$mode"); outbound=$(mode_outbound_tag "$mode")
+  case $mode in
+    v4) check_ipv4_egress || die "系统检测到 IPv4 外网不可用, 无法部署 IPv4 专用节点。" ;;
+    v6) check_ipv6_egress || die "系统检测到 IPv6 外网不可用, 无法部署 IPv6 节点。" ;;
+  esac
+
+  printf '\n'
+  ui_run "安装 / 检查 sing-box 环境" ensure_installed || die "环境准备失败, 未写入任何节点配置。"
+
+  t0=$(ui_now_us)
+  keypair=$(generate_reality_keypair)
+  private_key=${keypair%%|*}; public_key=${keypair#*|}
+  short_id=$(openssl rand -hex 4)
+  uuid=$(new_uuid)
+  reality=$(jq -n --arg handshake "$handshake" --arg private_key "$private_key" --arg short_id "$short_id" \
+    '{enabled:true,handshake:{server:$handshake,server_port:443},private_key:$private_key,short_id:[$short_id]}')
+  tlsj=$(jq -n --arg handshake "$handshake" --argjson reality "$reality" '{enabled:true,server_name:$handshake,reality:$reality}')
+  inbound=$(jq -n --arg tag "$tag" --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" --argjson tls "$tlsj" \
+    '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",uuid:$uuid,flow:"xtls-rprx-vision"}],tls:$tls}')
+  t1=$(ui_now_us)
+  printf ' %s%s%s 生成密钥与配置  %s%d.%ds%s\n' "$GREEN" "$G_OK" "$NC" "$DIM" $(((t1-t0)/1000000)) $((((t1-t0)%1000000)/100000)) "$NC"
+
+  flag=$(get_cached_flag)
+  PENDING_TAG=$tag
+  ui_run "校验并应用配置 (自动备份 / 失败回滚)" apply_inbound_with_route "$inbound" "$tag" "$outbound" \
+    || die "配置未能生效, 已按原逻辑回滚。详见上方日志。"
+  encname=$(printf '%s' "$name" | jq -sRr '@uri')
+  uri="vless://${uuid}@$(format_host_uri "$host"):${port}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=${handshake}&fp=chrome&pbk=${public_key}&sid=${short_id}#${flag}%20${encname}"
+  t0=$(ui_now_us)
+  save_connection "vless-reality-${mode}" "$tag" "$host" "$port" "$uri"
+  t1=$(ui_now_us)
+  printf ' %s%s%s 登记连接记录  %s%d.%ds%s\n' "$GREEN" "$G_OK" "$NC" "$DIM" $(((t1-t0)/1000000)) $((((t1-t0)%1000000)/100000)) "$NC"
+  ui_run "放行防火墙 ${port}/tcp" open_firewall_port "$port" tcp || warn "防火墙放行未成功, 可在节点列表用 f 命令修复。"
+  ok "VLESS Reality (${mode}) 已部署 (绑定出口: ${outbound})"
+  print_result_block "VLESS Reality" "$uri" "$tag"
+}
+
+
+# ===========================================================================
+# 诊断报告: ✓ 通过 / ! 警告 / ✗ 异常 / – 跳过, 末尾汇总 + 建议
+# ===========================================================================
+DG_PASS=0; DG_WARN=0; DG_FAIL=0; DG_SKIP=0; DG_HINTS=()
+
+dg() {   # dg <ok|warn|fail|skip> <文本> [详情]
+  local lvl=$1 text=$2 detail=${3:-} icon color
+  case $lvl in
+    ok)   icon=$G_OK;   color=$GREEN;  DG_PASS=$((DG_PASS+1)) ;;
+    warn) icon=$G_WARN; color=$YELLOW; DG_WARN=$((DG_WARN+1)) ;;
+    fail) icon=$G_X;    color=$RED;    DG_FAIL=$((DG_FAIL+1)) ;;
+    *)    icon=$G_SKIP; color=$DIM;    DG_SKIP=$((DG_SKIP+1)) ;;
+  esac
+  printf ' %s%s%s %s' "$color" "$icon" "$NC" "$(ui_pad "$text" 30)"
+  if [[ -n $detail ]]; then printf ' %s%s%s' "$DIM" "$detail" "$NC"; fi
+  printf '\n'
+  return 0
+}
+
+dg_hint() {
+  local h
+  for h in "${DG_HINTS[@]}"; do
+    if [[ $h == "$1" ]]; then return 0; fi
+  done
+  DG_HINTS+=("$1")
+  return 0
+}
+
+diag_check_singbox() {
+  local ver
+  if ! command -v sing-box >/dev/null 2>&1; then
+    dg fail "sing-box 未安装" "sb install"; dg_hint "运行 ${BOLD}sb install${NC} 安装 sing-box"; return 0
+  fi
+  ver=$(sing-box version 2>/dev/null | awk 'NR==1{print $3}' || true)
+  if systemctl is-active --quiet sing-box 2>/dev/null; then dg ok "sing-box 服务运行中" "$ver"
+  else dg fail "sing-box 服务未运行" "$ver"; dg_hint "运行 ${BOLD}sb logs${NC} 查看启动失败原因"; fi
+  if [[ -f $CONFIG_FILE ]] && sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then dg ok "配置语法检查" "sing-box check 通过"
+  else dg fail "配置语法检查" "sing-box check 未通过"; dg_hint "运行 ${BOLD}sb rollback${NC} 恢复最近一次可用配置"; fi
+  return 0
+}
+
+diag_check_consistency() {
+  local -a itags=() ctags=()
+  local t c found miss=0 total=0
+  [[ -f $CONFIG_FILE && -f $STATE_FILE ]] || { dg skip "配置与连接记录对账" "缺少文件"; return 0; }
+  mapfile -t itags < <(jq -r '.inbounds[]? | select(.listen_port != null) | .tag' "$CONFIG_FILE" 2>/dev/null)
+  mapfile -t ctags < <(jq -r '.connections[]?.tag' "$STATE_FILE" 2>/dev/null)
+  total=${#itags[@]}
+  for t in "${itags[@]}"; do
+    found=0
+    for c in "${ctags[@]}"; do if [[ $t == "$c" ]]; then found=1; break; fi; done
+    if (( found == 0 )); then miss=$((miss+1)); fi
+  done
+  for c in "${ctags[@]}"; do
+    found=0
+    for t in "${itags[@]}"; do if [[ $t == "$c" ]]; then found=1; break; fi; done
+    if (( found == 0 )); then miss=$((miss+1)); fi
+  done
+  if (( miss == 0 )); then dg ok "配置与连接记录对账" "${total}/${total} 一致"
+  else dg warn "配置与连接记录对账" "${miss} 处不一致"; dg_hint "运行 ${BOLD}sb reconcile${NC} 对账并修复"; fi
+  return 0
+}
+
+diag_check_ports() {
+  local row tag type port listen proto bad=0 n=0
+  if ! command -v ss >/dev/null 2>&1; then dg skip "端口监听" "缺少 ss"; return 0; fi
+  ui_listen_snapshot
+  [[ -f $CONFIG_FILE ]] || return 0
+  while IFS=$'\t' read -r tag type port; do
+    [[ -n $tag ]] || continue
+    n=$((n+1))
+    for proto in $(_proto_fw_protocols "$type"); do
+      if [[ $LISTEN_SET != *" ${proto}:${port} "* ]]; then
+        bad=$((bad+1)); dg fail "端口 ${port}/${proto} 未监听" "节点 ${tag}"
+        dg_hint "运行 ${BOLD}sb logs${NC} 查看 ${tag} 未监听的原因"
+      fi
+    done
+  done < <(jq -r '.inbounds[]? | select(.listen_port != null) | [.tag, .type, (.listen_port|tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+  if (( n == 0 )); then dg skip "端口监听" "尚无入站"
+  elif (( bad == 0 )); then dg ok "端口监听" "${n}/${n} 正常"; fi
+  return 0
+}
+
+diag_check_firewall() {
+  local tag type port listen proto bad=0 n=0
+  if ! ui_fw_backend_present; then dg skip "本机防火墙" "未检测到, 仅需云厂商安全组"; return 0; fi
+  [[ -f $CONFIG_FILE ]] || return 0
+  while IFS=$'\t' read -r tag type port; do
+    [[ -n $tag ]] || continue
+    n=$((n+1))
+    for proto in $(_proto_fw_protocols "$type"); do
+      if ! _fw_port_allowed "$port" "$proto"; then
+        bad=$((bad+1)); dg warn "防火墙未放行 ${port}/${proto}" "节点 ${tag}"
+        dg_hint "运行 ${BOLD}sb reconcile${NC} 补放行, 或在节点列表用 f 编号"
+      fi
+    done
+  done < <(jq -r '.inbounds[]? | select(.listen_port != null and (.listen // "") != "127.0.0.1") | [.tag, .type, (.listen_port|tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+  if (( n == 0 )); then dg skip "防火墙放行" "尚无对外入站"
+  elif (( bad == 0 )); then dg ok "防火墙放行" "${n}/${n} 已放行"; fi
+  return 0
+}
+
+diag_check_dns() {
+  if command -v dig >/dev/null 2>&1; then
+    if [[ -n $(dig +short +time=3 +tries=1 example.com A 2>/dev/null | head -1 || true) ]]; then dg ok "DNS 解析" "example.com"; else dg warn "DNS 解析失败" "example.com"; fi
+  elif getent hosts example.com >/dev/null 2>&1; then dg ok "DNS 解析" "example.com"
+  else dg warn "DNS 解析失败" "example.com"; fi
+  return 0
+}
+
+diag_check_network() {
+  if check_ipv4_egress; then dg ok "IPv4 出网" "可用"; else dg warn "IPv4 出网" "不可用"; fi
+  if check_ipv6_egress; then dg ok "IPv6 出网" "可用"; else dg skip "IPv6 出网" "不可用 (非 IPv6 VPS 属正常)"; fi
+  return 0
+}
+
+diag_check_bbr() {
+  local cc qd
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)
+  qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)
+  if [[ $cc == bbr ]]; then dg ok "BBR 拥塞控制" "${cc} / ${qd}"
+  else dg warn "BBR 拥塞控制" "当前 ${cc}"; dg_hint "运行 ${BOLD}sb bbr${NC} 启用 BBR"; fi
+  return 0
+}
+
+diag_check_cloudflared() {
+  if command -v cloudflared >/dev/null 2>&1; then
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then dg ok "Cloudflare Tunnel" "运行中"; else dg warn "Cloudflare Tunnel 未运行" "已安装"; fi
+  else
+    dg skip "Cloudflare Tunnel 未配置" "跳过"
+  fi
+  return 0
+}
+
+diag_check_resources() {
+  local pct ipct avail ntp
+  pct=$(df --output=pcent / 2>/dev/null | tail -n1 | tr -dc '0-9' || true)
+  ipct=$(df --output=ipcent / 2>/dev/null | tail -n1 | tr -dc '0-9' || true)
+  if [[ -n $pct ]]; then
+    if (( pct >= 90 )); then dg fail "磁盘 /" "已用 ${pct}% , 请清理"; elif (( pct >= 80 )); then dg warn "磁盘 /" "已用 ${pct}%"; else dg ok "磁盘 /" "已用 ${pct}%"; fi
+  fi
+  if [[ -n $ipct ]]; then
+    if (( ipct >= 90 )); then dg fail "inode /" "已用 ${ipct}%"; else dg ok "inode /" "已用 ${ipct}%"; fi
+  fi
+  avail=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}' || true)
+  if [[ $avail =~ ^[0-9]+$ ]]; then
+    if (( avail < 100 )); then dg warn "可用内存" "${avail} MB"; else dg ok "可用内存" "${avail} MB"; fi
+  fi
+  ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
+  case $ntp in
+    yes) dg ok "时间同步 (NTP)" ;;
+    no)  dg warn "时间未同步" "可能影响证书与 Reality 握手"; dg_hint "运行 ${BOLD}timedatectl set-ntp true${NC} 启用时间同步" ;;
+    *)   dg skip "时间同步 (NTP)" "无法判断" ;;
+  esac
+  return 0
+}
+
+run_diagnostics() {
+  local h
+  DG_PASS=0; DG_WARN=0; DG_FAIL=0; DG_SKIP=0; DG_HINTS=()
+  title "诊断报告"
+  ui_hr
+  diag_check_singbox
+  diag_check_consistency
+  diag_check_ports
+  diag_check_firewall
+  diag_check_network
+  diag_check_dns
+  diag_check_bbr
+  diag_check_cloudflared
+  diag_check_resources
+  ui_hr
+  printf '结果：%s%d 通过%s  %s%d 警告%s  %s%d 异常%s' "$GREEN" "$DG_PASS" "$NC" "$YELLOW" "$DG_WARN" "$NC" "$RED" "$DG_FAIL" "$NC"
+  if (( DG_SKIP > 0 )); then printf '  %s(%d 跳过)%s' "$DIM" "$DG_SKIP" "$NC"; fi
+  printf '\n'
+  if (( ${#DG_HINTS[@]} > 0 )); then
+    for h in "${DG_HINTS[@]}"; do printf '建议：%s\n' "$h"; done
+  else
+    printf '建议：%s暂无需要处理的项目%s\n' "$DIM" "$NC"
+  fi
+  return 0
+}
+
+# 只读版前置检查: 状态/健康类只读命令不再隐式安装 sing-box 或改写配置
+ensure_installed_ro() {
+  if ! command -v sing-box >/dev/null 2>&1; then
+    warn "sing-box 尚未安装, 请先运行: sb install"
+    return 1
+  fi
+  return 0
+}
+
+health_check() {
+  DG_PASS=0; DG_WARN=0; DG_FAIL=0; DG_SKIP=0; DG_HINTS=()
+  ensure_installed_ro || return 0
+  title "系统健康检查"
+  if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then dg ok "sing-box 语法检测" "通过"; else dg fail "sing-box 语法检测" "失败"; fi
+  if systemctl is-active --quiet sing-box 2>/dev/null; then dg ok "sing-box 服务状态" "运行中"; else dg fail "sing-box 服务状态" "未运行"; fi
+  if command -v cloudflared >/dev/null 2>&1; then
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then dg ok "cloudflared 状态" "运行中"; else dg fail "cloudflared 状态" "未运行"; fi
+  fi
+  if command -v warp-cli >/dev/null 2>&1; then
+    if warp-cli --accept-tos status 2>/dev/null | grep -qi Connected; then dg ok "WARP 状态" "已连接"; else dg fail "WARP 状态" "未连接"; fi
+  fi
+  printf '\n出站规则列表:\n'
+  jq -r '.outbounds[]? | "- \(.tag) [\(.type)] domain_resolver 策略: \(.domain_resolver.strategy // "默认")"' "$CONFIG_FILE"
+  if (( DG_FAIL == 0 )); then ok "各项健康检查正常"; else warn "健康检查发现异常, 请运行 'sb logs' 或 'sb diag' 排查。"; fi
+  return 0
+}
+
+show_status() {
+  local stack v4_status="不可用" v6_status="不可用" public_ipv4 public_ipv6
+  ensure_installed_ro || return 0
+  stack=$(detect_network_stack)
+  case "$stack" in
+    dual)   v4_status="可用"; v6_status="可用" ;;
+    v4only) v4_status="可用" ;;
+    v6only) v6_status="可用" ;;
+  esac
+  public_ipv4=$(detect_public_ip || true)
+  public_ipv6=$(detect_public_ipv6 || true)
+  printf '\nsing-box 版本: '; sing-box version | head -n 1
+  printf '出站 IP 版本策略: domain_resolver (dns tag: %s)\n' "$SB_DNS_RESOLVER_TAG"
+  printf '网络栈判定: %s\n' "$stack"
+  printf '外网栈连通性: IPv4 [%s] | IPv6 [%s]\n' "$v4_status" "$v6_status"
+  printf '公网 IPv4: %s\n' "${public_ipv4:-未检测到}"
+  printf '公网 IPv6: %s\n' "${public_ipv6:-未检测到}"
+  printf '\n服务运行状态:\n'
+  systemctl --no-pager --full status sing-box || true
+  printf '\n当前入站与监听:\n'
+  jq -r '.inbounds[]? | "- \(.tag) [\(.type)] 监听 \(.listen // "Detour"):\(.listen_port // "-")"' "$CONFIG_FILE"
+}
+
+# 测试 / 以 source 方式引用时设置 SB_SOURCE_ONLY=1 只加载函数而不执行 main
+if [[ -z ${SB_SOURCE_ONLY:-} ]]; then main "$@"; fi
 
