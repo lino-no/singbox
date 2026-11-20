@@ -1,0 +1,3697 @@
+#!/usr/bin/env bash
+# ============================================================================
+# sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本0.0.1
+# Repository : https://github.com/lisiyong0707/singbox
+#
+# 功能总览:
+#   VLESS Reality / Reality gRPC / ShadowTLS v3+SS2022 / Shadowsocks 2022 /
+#   Trojan TLS / VLESS TLS / Hysteria2 / TUIC v5 / Cloudflare Tunnel /
+#   Cloudflare WARP 出站 / 订阅系统 (sing-box / Clash Meta / Shadowrocket) /
+#   节点二维码 / 证书管理 (Certbot 自动续期) / 系统诊断 / 测速 / 配置备份回滚
+#
+# 设计原则:
+#   - set -Eeuo pipefail 严格模式, 全程 trap 统一错误处理
+#   - 所有配置写入 (config.json / state.json / 订阅文件) 一律 mktemp + 校验 + install 原子替换
+#   - 所有 jq 变更一律先在候选文件上验证 (sing-box check / jq 语法), 失败绝不覆盖生产文件,
+#     并自动保留最近一次可用配置备份用于一键回滚
+#   - 绝不使用 eval; 所有用户输入统一走 ask_*/valid_* 校验管道, 拒绝把用户输入直接嵌入
+#     shell 命令行或不受控的变量展开中
+#
+# 终端能力说明 (交互菜单):
+#   OSC 52 复制依赖 SSH 客户端允许剪贴板控制序列；不支持时可选择 p 输出完整链接。
+#   彩色徽标依赖 UTF-8 与 truecolor/24-bit ANSI；NO_COLOR、非终端、窄屏或不支持真彩色时
+#   降级为纯文字品牌。二维码在窄于 60 列时不绘制字符图，仍保存 PNG 文件。
+# ============================================================================
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+readonly SCRIPT_VERSION="0.1.0"
+readonly SB_MIN_VERSION="1.12.0"
+
+readonly CONFIG_DIR="/etc/sing-box"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
+readonly STATE_DIR="/var/lib/sing-box-vps"
+readonly STATE_FILE="${STATE_DIR}/connections.json"
+readonly BACKUP_DIR="${STATE_DIR}/backups"
+readonly SUB_DIR="${STATE_DIR}/subscriptions"
+readonly QR_CACHE_DIR="${STATE_DIR}/qrcache"
+readonly LOG_FILE="${STATE_DIR}/sing-box-vps.log"
+
+readonly CF_CONFIG_DIR="/etc/cloudflared"
+readonly CF_CONFIG_FILE="${CF_CONFIG_DIR}/config.yml"
+readonly CF_CRED_DIR="${CF_CONFIG_DIR}/creds"
+
+readonly CERT_HOOK="/etc/letsencrypt/renewal-hooks/deploy/restart-sing-box"
+readonly MANAGER_PATH="/usr/local/sbin/sing-box-vps"
+readonly SHORTCUT_PATH="/usr/local/bin/sb"
+readonly SUB_HTTPD_UNIT="/etc/systemd/system/sing-box-vps-sub.service"
+readonly LOCK_FILE="/run/sing-box-vps.lock"
+readonly LOGROTATE_FILE="/etc/logrotate.d/sing-box-vps"
+
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lisiyong0707/singbox/main/sb.sh}"
+
+readonly REALITY_PRESET_DOMAINS=(
+  "gateway.icloud.com"
+  "mask.icloud.com"
+  "www.cloudflare.com"
+  "www.microsoft.com"
+  "www.google.com"
+  "www.apple.com"
+  "dl.google.com"
+  "swdist.apple.com"
+)
+
+# ---------------------------------------------------------------------------
+# 颜色与日志
+# ---------------------------------------------------------------------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; BOLD='\033[1m'; NC='\033[0m'
+if [[ ! -t 1 || -n ${NO_COLOR:-} ]]; then RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''; fi
+if [[ ${SB_THEME:-dark} == light ]]; then YELLOW='\033[0;33m'; fi
+
+run_with_progress() {
+  local label=$1; shift; local show_output=0
+  if [[ ${1:-} == --show-output ]]; then show_output=1; shift; fi
+  local started=$SECONDS rc=0 logtmp pid frame=0 frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' glyph
+  logtmp=$(mktemp "${TMPDIR:-/tmp}/sb-progress.XXXXXX") || return 1
+  if [[ ${LC_ALL:-${LANG:-}} != *UTF-8* && ${LC_ALL:-${LANG:-}} != *utf8* ]]; then frames='|/-\\'; fi
+  "$@" >"$logtmp" 2>&1 & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    glyph=${frames:$((frame % ${#frames})):1}; printf '\r%s %s ... %ss' "$glyph" "$label" "$((SECONDS-started))"
+    frame=$((frame+1)); sleep 0.2
+  done
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  if (( rc == 0 )); then
+    printf '\r✓ %s (%ss)\n' "$label" "$((SECONDS-started))"
+    cat "$logtmp" >> "$LOG_FILE" 2>/dev/null || true
+    if (( show_output )); then cat "$logtmp"; fi
+  else
+    printf '\r✗ %s (%ss)\n' "$label" "$((SECONDS-started))" >&2
+    tail -n 10 "$logtmp" >&2
+    printf '详细日志: %s\n' "$LOG_FILE" >&2
+    cat "$logtmp" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+  rm -f "$logtmp"
+  return "$rc"
+}
+
+# 计算字符串显示宽度 (按 Unicode 东亚宽度标准: 全角/宽字符算 2, 其余算 1), 用于菜单列对齐
+# 比手工判断字符范围更准确, 能正确处理中英文混排的情况
+# 自动按列计算最大显示宽度并对齐打印, 不需要再手动指定固定宽度数字
+# 用法: _print_menu_cols <每行列数> "第1项" "第2项" "第3项" ...
+_print_menu_cols() {
+  local ncols=$1; shift
+  python3 -c "
+import sys, unicodedata
+
+def width(s):
+    w = 0
+    for ch in s:
+        ea = unicodedata.east_asian_width(ch)
+        w += 2 if ea in ('W', 'F') else 1
+    return w
+
+ncols = int(sys.argv[1])
+items = sys.argv[2:]
+
+# 按列位置分组, 分别算每一列里最宽的那一项 (而不是全部项统一一个宽度)
+col_max = [0] * ncols
+for i, it in enumerate(items):
+    c = i % ncols
+    col_max[c] = max(col_max[c], width(it))
+
+gap = 2  # 列与列之间额外留的间距
+for i, it in enumerate(items):
+    c = i % ncols
+    pad = col_max[c] - width(it) + gap
+    sys.stdout.write(it + ' ' * pad)
+    if c == ncols - 1 or i == len(items) - 1:
+        sys.stdout.write('\n')
+" "$ncols" "$@"
+}
+
+_log_raw() {
+  # 日志文件不含颜色转义, 便于后续 grep/诊断
+  [[ -d $STATE_DIR ]] || install -d -m 700 "$STATE_DIR" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+DIAG_ACTIVE=0 DIAG_PASS=0 DIAG_WARN=0 DIAG_FAIL=0 DIAG_SKIP=0
+info() { printf "${BLUE}[i]${NC} %s\n" "$*"; _log_raw "[INFO] $*"; }
+diag_skip() { if (( DIAG_ACTIVE )); then ((DIAG_SKIP+=1)) || true; printf '– %s (跳过)\n' "$*"; else info "$* (跳过)"; fi; }
+ok()   { if (( DIAG_ACTIVE )); then ((DIAG_PASS+=1)) || true; printf '✓ %s\n' "$*"; else printf "${GREEN}[+]${NC} %s\n" "$*"; fi; _log_raw "[OK] $*"; }
+warn() { if (( DIAG_ACTIVE )); then ((DIAG_WARN+=1)) || true; printf '! %s\n' "$*" >&2; else printf "${YELLOW}[!]${NC} %s\n" "$*" >&2; fi; _log_raw "[WARN] $*"; }
+die()  { (( DIAG_ACTIVE )) && ((DIAG_FAIL+=1)) || true; printf "${RED}[x]${NC} %s\n" "$*" >&2; _log_raw "[FATAL] $*"; exit 1; }
+title(){ printf "\n${BOLD}${CYAN}== %s ==${NC}\n" "$*"; }
+
+on_error() {
+  local exit_code=$? line=$1
+  local func="${FUNCNAME[1]:-主流程}"
+  printf "${RED}[x]${NC} 运行失败: 函数 [%s] 第 %s 行退出 (状态码 %s)\n" "$func" "$line" "$exit_code" >&2
+  printf "${RED}[x]${NC} 出错命令: %s\n" "${BASH_COMMAND:-未知}" >&2
+  if (( ${#FUNCNAME[@]} > 2 )); then
+    local i trace=""
+    for ((i=1; i<${#FUNCNAME[@]}-1; i++)); do
+      trace+="${FUNCNAME[$i]}"
+      (( i < ${#FUNCNAME[@]}-2 )) && trace+=" <- "
+    done
+    printf "${RED}[x]${NC} 调用链: %s\n" "$trace" >&2
+  fi
+  printf "${RED}[x]${NC} 日志文件: %s\n" "$LOG_FILE" >&2
+  _log_raw "[FATAL] func=${func} line=${line} exit=${exit_code} cmd=${BASH_COMMAND:-unknown}"
+  exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+# ---- 中断提示: 部署进行中被打断时, 告诉用户去跑 reconcile ----
+PENDING_TAG=""
+MENU_ACTIVE=0 MENU_ACTION_ACTIVE=0 MENU_INTERRUPT_COUNT=0
+
+on_interrupt() {
+  local sig=$1 code=130
+  case $sig in
+    TERM) code=143 ;;
+    HUP)  code=129 ;;
+  esac
+  if [[ -n $PENDING_TAG ]]; then
+    warn "收到 ${sig}: 节点 [${PENDING_TAG}] 可能已写入并生效, 但连接记录/防火墙可能未完成。请运行: sb reconcile" || true
+    exit "$code"
+  elif (( MENU_ACTION_ACTIVE )); then
+    warn "操作已中断；返回菜单。" || true
+    exit "$code"
+  elif (( MENU_ACTIVE )); then
+    ((MENU_INTERRUPT_COUNT+=1))
+    if (( MENU_INTERRUPT_COUNT == 1 )); then warn "再按一次 Ctrl+C 或输入 0 退出。" || true; return 0; fi
+    exit "$code"
+  else
+    warn "已中断 (${sig})。" || true
+    exit "$code"
+  fi
+}
+trap 'on_interrupt INT'  INT
+trap 'on_interrupt TERM' TERM
+trap 'on_interrupt HUP'  HUP
+
+# ---------------------------------------------------------------------------
+# 基础前置检查
+# ---------------------------------------------------------------------------
+require_root()    { [[ ${EUID} -eq 0 ]] || die "请使用 sudo bash $0 运行。"; }
+require_systemd() { command -v systemctl >/dev/null 2>&1 || die "此脚本需要 systemd 环境支持。"; }
+require_apt()      { command -v apt-get  >/dev/null 2>&1 || die "当前版本仅支持 Debian/Ubuntu (APT) 系统。"; }
+require_cmd() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "缺少必要命令: ${c} (请先运行安装/修复环境)。"
+  done
+}
+
+ensure_dirs() {
+  install -d -m 700 "$CONFIG_DIR" "$STATE_DIR" "$BACKUP_DIR" "$SUB_DIR" "$QR_CACHE_DIR"
+  fix_config_perms
+  if [[ ! -f $STATE_FILE ]]; then
+    printf '{"connections":[]}\n' > "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+  fi
+  [[ -f $LOG_FILE ]] || { : > "$LOG_FILE"; chmod 600 "$LOG_FILE"; }
+  ensure_logrotate
+}
+
+ensure_logrotate() {
+  # 脚本自身的操作日志 (非 sing-box 服务日志, 那部分已由 systemd-journald 管理) 需要
+  # 自行轮转, 否则长期运行会无限增长
+  [[ -f $LOGROTATE_FILE ]] && return 0
+  command -v logrotate >/dev/null 2>&1 || return 0
+  tee "$LOGROTATE_FILE" >/dev/null <<EOF
+${LOG_FILE} {
+  weekly
+  rotate 8
+  compress
+  missingok
+  notifempty
+  size 5M
+}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 交互输入与严格校验 (杜绝命令注入 / 非法值)
+# ---------------------------------------------------------------------------
+confirm() {
+  local prompt=$1 default=${2:-N} answer
+  IFS= read -r -e -p "$prompt [$([[ $default == Y ]] && printf 'Y/n' || printf 'y/N')]: " answer || true
+  answer=${answer:-$default}
+  [[ $answer =~ ^[Yy]$ ]]
+}
+
+ask_required() {
+  local prompt=$1 value
+  while true; do
+    IFS= read -r -e -p "$prompt: " value || true
+    [[ -n $value ]] && { printf '%s' "$value"; return 0; }
+    warn "此项不能为空。"
+  done
+}
+
+# 仅允许安全字符集, 阻断任何可能用于命令注入 / 路径穿越的输入
+valid_safe_token() {
+  [[ $1 =~ ^[A-Za-z0-9_.:-]{1,128}$ ]]
+}
+
+valid_port() {
+  [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+ask_port() {
+  local prompt=$1 default=$2 value
+  while true; do
+    IFS= read -r -e -i "$default" -p "$prompt: " value || true
+    value=${value:-$default}
+    valid_port "$value" && { printf '%s' "$((10#$value))"; return 0; }
+    warn "端口必须是 1 到 65535 之间的整数。"
+  done
+}
+
+valid_hostname() {
+  [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
+
+ask_hostname() {
+  local prompt=$1 default=${2:-} value
+  while true; do
+    if [[ -n $default ]]; then
+      IFS= read -r -e -p "$prompt [$default]: " value || true
+      value=${value:-$default}
+    else
+      IFS= read -r -e -p "$prompt: " value || true
+    fi
+    valid_hostname "$value" && { printf '%s' "$value"; return 0; }
+    warn "域名格式不正确, 请重新输入。"
+  done
+}
+
+valid_ipv4() {
+  local ip=$1 a b c d o
+  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  IFS=. read -r a b c d <<<"$ip"
+  for o in "$a" "$b" "$c" "$d"; do (( 10#$o <= 255 )) || return 1; done
+  return 0
+}
+
+valid_ipv6() {
+  [[ $1 =~ ^[0-9a-fA-F:]+$ && $1 == *:* ]]
+}
+
+# ---------------------------------------------------------------------------
+# 原子写入引擎: 任意"候选文件"写好之后, 通过本函数校验并原子替换目标文件,
+# 校验失败绝不落地, 不污染生产文件
+# ---------------------------------------------------------------------------
+fix_config_perms() {
+  getent group sing-box >/dev/null 2>&1 || return 0
+  chgrp sing-box "$CONFIG_DIR" 2>/dev/null || true
+  chmod 750 "$CONFIG_DIR"
+  if [[ -f $CONFIG_FILE ]]; then
+    chgrp sing-box "$CONFIG_FILE" 2>/dev/null || true
+    chmod 640 "$CONFIG_FILE"
+  fi
+  return 0
+}
+
+atomic_install() {
+  # atomic_install <candidate_tmp_file> <dest_path> <mode>
+  local candidate=$1 dest=$2 mode=${3:-600}
+  [[ -s $candidate ]] || die "内部错误: 候选文件为空, 拒绝写入 ${dest}。"
+  install -m "$mode" "$candidate" "$dest"
+    if [[ $dest == "$CONFIG_FILE" ]]; then fix_config_perms; fi
+}
+
+json_validate() {
+  # 仅校验合法 JSON 语法
+  local file=$1
+  jq -e . "$file" >/dev/null 2>&1
+}
+
+atomic_json_update() {
+  # atomic_json_update <target_file> <jq_filter> [jq_args...]
+  # 将 jq_filter 应用到 target_file, 结果写入临时文件并校验 JSON 合法性,
+  # 校验通过才原子替换; 失败则保留原文件不变并返回非零
+  local target=$1 filter=$2; shift 2
+  local candidate
+  candidate=$(mktemp "${target}.XXXXXX")
+  if ! jq "$filter" "$@" "$target" > "$candidate" 2>>"$LOG_FILE"; then
+    rm -f "$candidate"
+    warn "jq 变更执行失败, 已保留原文件不变: ${target}"
+    return 1
+  fi
+  if ! json_validate "$candidate"; then
+    rm -f "$candidate"
+    warn "jq 变更结果 JSON 校验失败, 已回滚: ${target}"
+    return 1
+  fi
+  atomic_install "$candidate" "$target" 600
+  rm -f "$candidate" 2>/dev/null || true
+  return 0
+}
+# 与 atomic_json_update 类似, 但专供 CONFIG_FILE 的自愈/迁移函数使用:
+# 在 JSON 语法校验之外额外跑一次 sing-box check, 两者都通过才落地。
+# 避免"JSON 合法但 sing-box 不认"的配置被自愈逻辑悄悄写进生产文件,
+# 导致下一次真正部署节点时才报错、却让人误以为是新节点的问题。
+atomic_config_update_checked() {
+  local filter=$1; shift
+  local candidate
+  candidate=$(mktemp "${CONFIG_FILE}.XXXXXX")
+  if ! jq "$filter" "$@" "$CONFIG_FILE" > "$candidate" 2>>"$LOG_FILE"; then
+    rm -f "$candidate"
+    warn "jq 变更执行失败, 已保留原文件不变: ${CONFIG_FILE}"
+    return 1
+  fi
+  if ! json_validate "$candidate"; then
+    rm -f "$candidate"
+    warn "jq 变更结果 JSON 校验失败, 已回滚: ${CONFIG_FILE}"
+    return 1
+  fi
+  if ! sing-box check -c "$candidate" >>"$LOG_FILE" 2>&1; then
+    rm -f "$candidate"
+    warn "自动迁移生成的配置未通过 sing-box check 校验, 已保留原配置不变, 详见 ${LOG_FILE}。"
+    return 1
+  fi
+  atomic_install "$candidate" "$CONFIG_FILE" 600
+  rm -f "$candidate" 2>/dev/null || true
+  return 0
+}
+# ---------------------------------------------------------------------------
+# 网络栈探测: IPv4 Only / IPv6 Only / Dual Stack
+# 优先通过路由表判断 (ip -4/-6 route), 再辅以出网连通性探测作为兜底/确认
+# ---------------------------------------------------------------------------
+has_ipv4_route() { ip -4 route show default 2>/dev/null | grep -q '.'; }
+has_ipv6_route() { ip -6 route show default 2>/dev/null | grep -q '.'; }
+
+check_ipv4_egress() {
+  has_ipv4_route || return 1
+  curl -4fsS --connect-timeout 2 --max-time 3 https://api.ipify.org >/dev/null 2>&1 && return 0
+  curl -4fsS --connect-timeout 2 --max-time 3 https://www.cloudflare.com >/dev/null 2>&1 && return 0
+  ping -4 -c 1 -W 2 1.1.1.1 >/dev/null 2>&1
+}
+
+check_ipv6_egress() {
+  has_ipv6_route || return 1
+  curl -6fsS --connect-timeout 2 --max-time 3 https://api64.ipify.org >/dev/null 2>&1 && return 0
+  curl -6fsS --connect-timeout 2 --max-time 3 https://www.cloudflare.com >/dev/null 2>&1 && return 0
+  ping -6 -c 1 -W 2 2606:4700:4700::1111 >/dev/null 2>&1
+}
+
+# 返回: v4only | v6only | dual | none
+detect_network_stack() {
+  local v4=0 v6=0
+  check_ipv4_egress && v4=1
+  check_ipv6_egress && v6=1
+  if (( v4 == 1 && v6 == 1 )); then printf 'dual'
+  elif (( v4 == 1 )); then printf 'v4only'
+  elif (( v6 == 1 )); then printf 'v6only'
+  else printf 'none'
+  fi
+}
+
+detect_public_ip() {
+  local ip endpoint
+  for endpoint in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip=$(curl -4fsS --connect-timeout 3 --max-time 5 "$endpoint" 2>/dev/null | tr -d '[:space:]' || true)
+    valid_ipv4 "$ip" && { printf '%s' "$ip"; return 0; }
+  done
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+detect_public_ipv6() {
+  local ip endpoint
+  for endpoint in https://api64.ipify.org https://ifconfig.co/ip; do
+    ip=$(curl -6fsS --connect-timeout 3 --max-time 5 "$endpoint" 2>/dev/null | tr -d '[:space:]' || true)
+    valid_ipv6 "$ip" && { printf '%s' "$ip"; return 0; }
+  done
+  return 0
+}
+
+readonly IP_CACHE_FILE="${STATE_DIR}/ip_cache"
+
+# 缓存公网 IPv4/IPv6, 300 秒内复用, 避免菜单每次重绘都发起网络请求
+get_cached_public_ips() {
+  local now cached_time v4 v6
+  now=$(date +%s)
+  if [[ -f $IP_CACHE_FILE ]]; then
+    cached_time=$(sed -n '1p' "$IP_CACHE_FILE" 2>/dev/null)
+    if [[ $cached_time =~ ^[0-9]+$ ]] && (( now - cached_time < 300 )); then
+      v4=$(sed -n '2p' "$IP_CACHE_FILE")
+      v6=$(sed -n '3p' "$IP_CACHE_FILE")
+      printf '%s|%s' "$v4" "$v6"
+      return 0
+    fi
+  fi
+  v4=$(detect_public_ip || true)
+  v6=$(detect_public_ipv6 || true)
+  { printf '%s\n%s\n%s\n' "$now" "$v4" "$v6"; } > "$IP_CACHE_FILE" 2>/dev/null || true
+  printf '%s|%s' "$v4" "$v6"
+}
+
+format_host_uri() {
+  local host=$1
+  if [[ $host == *:* && $host != \[*\] ]]; then
+    printf '[%s]' "$host"
+  else
+    printf '%s' "$host"
+  fi
+}
+
+get_server_flag() {
+  local country
+  # 增加更多备用接口，最后兜底返回地球emoji
+  country=$(curl -4fsS --connect-timeout 3 --max-time 5 "https://ipapi.co/country/" 2>/dev/null | tr -d '[:space:]') \
+  || country=$(curl -4fsS --connect-timeout 3 --max-time 5 "https://api.country.is/" 2>/dev/null | jq -r '.country // empty' 2>/dev/null) \
+  || country=$(curl -4fsS --connect-timeout 3 --max-time 5 "https://ipinfo.io/country" 2>/dev/null | tr -d '[:space:]') \
+  || country=$(curl -4fsS --connect-timeout 3 --max-time 5 "https://ip.sb/geoip" 2>/dev/null | jq -r '.country_code // empty' 2>/dev/null) \
+  || country=""
+
+  if [[ $country =~ ^[A-Za-z]{2}$ ]]; then
+    python3 -c "c='$country'.upper();print(''.join(chr(0x1F1E6+ord(x)-65) for x in c))"
+  else
+    printf "🌐"
+  fi
+}
+
+# sing-box outbound 层的 IP 版本策略字段几经变迁:
+#   - 1.11 之前: 出站字段 domain_strategy (prefer_ipv4/prefer_ipv6/ipv4_only/ipv6_only)
+#   - 1.12 起: domain_strategy 标记为废弃, 替换为 domain_resolver (引用 dns.servers 中的
+#     一个 server tag, 并可选带 strategy), network_strategy 是完全不同的字段
+#     (仅用于 Android/Apple 图形客户端的多网络接口选路, 与 IPv4/IPv6 偏好无关)
+#   - 1.14 起: domain_strategy 若未设置环境变量 ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS
+#     会直接校验失败
+# 因此本脚本统一采用 domain_resolver + 一个内置 DNS server 的现代方案, 不再探测/使用
+# network_strategy 或 domain_strategy 字段。
+readonly SB_DNS_RESOLVER_TAG="dns-direct"
+
+ensure_dns_resolver() {
+  if jq -e --arg tag "$SB_DNS_RESOLVER_TAG" \
+      '(.dns.servers // []) | any(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+  atomic_json_update "$CONFIG_FILE" '
+    .dns = ((.dns // {}) | .servers = ((.servers // []) + [{type:"udp", tag:$tag, server:"1.1.1.1"}]))
+  ' --arg tag "$SB_DNS_RESOLVER_TAG" || true
+}
+
+ensure_route_default_resolver() {
+  if jq -e --arg tag "$SB_DNS_RESOLVER_TAG" \
+      '.route.default_domain_resolver == $tag' "$CONFIG_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+  atomic_json_update "$CONFIG_FILE" '
+    .route = ((.route // {}) | .rules = (.rules // []) | .final = (.final // "direct")
+              | .default_domain_resolver = $tag)
+  ' --arg tag "$SB_DNS_RESOLVER_TAG" || true
+}
+
+ensure_direct_outbounds() {
+  local candidate
+  if jq -e --arg tag "$SB_DNS_RESOLVER_TAG" '
+      (.outbounds // []) as $o |
+      ($o | any(.tag=="direct")) and
+      ($o | any(.tag=="direct-v4" and .domain_resolver.server==$tag)) and
+      ($o | any(.tag=="direct-v6" and .domain_resolver.server==$tag)) and
+      ($o | any(.tag=="direct-dual" and .domain_resolver.server==$tag))
+    ' "$CONFIG_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+  candidate=$(mktemp)
+  jq --arg tag "$SB_DNS_RESOLVER_TAG" '
+    .outbounds = (.outbounds // []) |
+    (if (.outbounds | any(.tag=="direct")) then . else .outbounds += [{type:"direct", tag:"direct"}] end) |
+    (if (.outbounds | any(.tag=="direct-v4")) then . else
+      .outbounds += [{type:"direct", tag:"direct-v4", domain_resolver:{server:$tag, strategy:"ipv4_only"}}] end) |
+    (if (.outbounds | any(.tag=="direct-v6")) then . else
+      .outbounds += [{type:"direct", tag:"direct-v6", domain_resolver:{server:$tag, strategy:"ipv6_only"}}] end) |
+    (if (.outbounds | any(.tag=="direct-dual")) then . else
+      .outbounds += [{type:"direct", tag:"direct-dual", domain_resolver:{server:$tag, strategy:"prefer_ipv6"}}] end)
+  ' "$CONFIG_FILE" > "$candidate"
+  if json_validate "$candidate"; then
+    atomic_install "$candidate" "$CONFIG_FILE" 600
+  else
+    warn "自动补齐基础出站失败, 请运行 'sb diag' 或检查 ${CONFIG_FILE} 是否损坏。"
+  fi
+  rm -f "$candidate"
+}
+
+# create_base_config() 只在 config.json 完全不存在时才会写入 route.default_domain_resolver,
+# 对于早于该字段被引入之前就已生成的旧配置文件 (或手动编辑过的配置) 不会自动补上,
+# 导致 sing-box 1.12+ 在校验时报 "missing route.default_domain_resolver ... deprecated" 并 FATAL。
+# 这里单独做一次幂等自愈: 已存在则跳过, 缺失则补上, 不影响其余 route 字段。
+ensure_route_default_resolver() {
+  if jq -e --arg tag "$SB_DNS_RESOLVER_TAG" \
+      '.route.default_domain_resolver == $tag' "$CONFIG_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+  atomic_config_update_checked '
+    .route = ((.route // {}) | .rules = (.rules // []) | .final = (.final // "direct")
+              | .default_domain_resolver = $tag)
+  ' --arg tag "$SB_DNS_RESOLVER_TAG" || true
+}
+
+# 同理: direct / direct-v4 / direct-v6 / direct-dual 四个基础出站也可能在老配置里缺失
+# (例如从更早版本的脚本升级过来), mode_outbound_tag() 生成的 inbound 路由规则会引用
+# 这些 tag, 缺失时 sing-box check 会直接报 "outbound not found"。这里按 tag 逐个补齐,
+# 已存在的 tag 不会被覆盖或重复添加。
+ensure_direct_outbounds() {
+  local candidate
+  if jq -e --arg tag "$SB_DNS_RESOLVER_TAG" '
+      (.outbounds // []) as $o |
+      ($o | any(.tag=="direct")) and
+      ($o | any(.tag=="direct-v4" and .domain_resolver.server==$tag)) and
+      ($o | any(.tag=="direct-v6" and .domain_resolver.server==$tag)) and
+      ($o | any(.tag=="direct-dual" and .domain_resolver.server==$tag))
+    ' "$CONFIG_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+  candidate=$(mktemp)
+  jq --arg tag "$SB_DNS_RESOLVER_TAG" '
+    .outbounds = (.outbounds // []) |
+    (if (.outbounds | any(.tag=="direct")) then . else .outbounds += [{type:"direct", tag:"direct"}] end) |
+    (if (.outbounds | any(.tag=="direct-v4")) then . else
+      .outbounds += [{type:"direct", tag:"direct-v4", domain_resolver:{server:$tag, strategy:"ipv4_only"}}] end) |
+    (if (.outbounds | any(.tag=="direct-v6")) then . else
+      .outbounds += [{type:"direct", tag:"direct-v6", domain_resolver:{server:$tag, strategy:"ipv6_only"}}] end) |
+    (if (.outbounds | any(.tag=="direct-dual")) then . else
+      .outbounds += [{type:"direct", tag:"direct-dual", domain_resolver:{server:$tag, strategy:"prefer_ipv6"}}] end)
+  ' "$CONFIG_FILE" > "$candidate"
+  if json_validate "$candidate" && sing-box check -c "$candidate" >>"$LOG_FILE" 2>&1; then
+    atomic_install "$candidate" "$CONFIG_FILE" 600
+  else
+    warn "自动补齐基础出站失败 (JSON 或 sing-box check 未通过), 请运行 'sb diag' 或检查 ${CONFIG_FILE} 是否损坏, 详见 ${LOG_FILE}。"
+  fi
+  rm -f "$candidate"
+}
+
+ask_node_network_mode() {
+  local stack choice
+  stack=$(detect_network_stack)
+  printf "\n当前服务器网络栈: %s\n" "$stack" >&2
+  printf "选择节点接入与出站网络模式:\n" >&2
+  printf "  1) Dual 双栈节点 (监听 ::, 出站优先 IPv6 并自动回退 IPv4)\n" >&2
+  printf "  2) IPv4 专用节点 (监听 0.0.0.0, 出站强制仅使用 IPv4)\n" >&2
+  printf "  3) IPv6 严格节点 (监听 ::, 出站强制仅使用 IPv6, 不回退 IPv4)\n" >&2
+  IFS= read -r -e -p "请选择 [1]: " choice
+  choice=${choice:-1}
+  case "$choice" in
+    2)
+      check_ipv4_egress || die "系统检测到 IPv4 外网不可用, 无法部署 IPv4 专用节点。"
+      printf 'v4' ;;
+    3)
+      check_ipv6_egress || die "系统检测到 IPv6 外网不可用, 无法部署 IPv6 节点。"
+      printf 'v6' ;;
+    *)
+      printf 'dual' ;;
+  esac
+}
+
+ask_node_server() {
+  local mode=$1 default val
+  case "$mode" in
+    v4)
+      default=$(detect_public_ip)
+      IFS= read -r -e -i "$default" -p '客户端连接 IPv4 地址: ' val
+      val=${val:-$default}
+      valid_ipv4 "$val" || valid_hostname "$val" || die "必须填写有效的 IPv4 地址或域名。"
+      ;;
+    v6)
+      default=$(detect_public_ipv6)
+      IFS= read -r -e -i "$default" -p '客户端连接 IPv6 地址: ' val
+      val=${val:-$default}
+      valid_ipv6 "$val" || valid_hostname "$val" || die "必须填写有效的 IPv6 地址或域名。"
+      ;;
+    *)
+      default=$(detect_public_ip)
+      [[ -z $default ]] && default=$(detect_public_ipv6)
+      IFS= read -r -e -i "$default" -p '客户端连接双栈地址 (推荐 A/AAAA 域名): ' val
+      val=${val:-$default}
+      [[ -n $val ]] || die "必须填写有效的连接域名或 IP。"
+      ;;
+  esac
+  printf '%s' "$val"
+}
+
+# 网络模式 -> (监听地址, 出站 tag) 映射, 消除各部署函数中的重复 case 块
+mode_listen_addr() {
+  case "$1" in
+    v4) printf '0.0.0.0' ;;
+    v6) printf '::' ;;
+    *)  printf '::' ;;
+  esac
+}
+mode_outbound_tag() {
+  case "$1" in
+    v4) printf 'direct-v4' ;;
+    v6) printf 'direct-v6' ;;
+    *)  printf 'direct-dual' ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# 安装与基础路由配置
+# ---------------------------------------------------------------------------
+install_prerequisites() {
+  require_apt
+  export DEBIAN_FRONTEND=noninteractive
+  run_with_progress "更新 APT 索引" apt-get update -qq
+  run_with_progress "安装基础依赖" apt-get install -y -qq ca-certificates curl jq openssl iproute2 gnupg qrencode dnsutils python3
+}
+
+install_sing_box() {
+  require_root; require_systemd; install_prerequisites
+  info "配置 sing-box 官方 APT 软件源"
+  install -d -m 755 /etc/apt/keyrings
+  run_with_progress "下载 sing-box APT 密钥" curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
+  chmod a+r /etc/apt/keyrings/sagernet.asc
+  tee /etc/apt/sources.list.d/sagernet.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://deb.sagernet.org/
+Suites: *
+Components: *
+Enabled: yes
+Signed-By: /etc/apt/keyrings/sagernet.asc
+EOF
+  run_with_progress "更新 sing-box APT 索引" apt-get update -qq
+  run_with_progress "安装 sing-box" apt-get install -y -qq sing-box
+  ensure_base_routing
+  systemctl enable sing-box >/dev/null 2>&1 || true
+  install_manager
+  ok "已安装 $(sing-box version | head -n 1)"
+}
+
+install_manager() {
+  local source_path=${BASH_SOURCE[0]:-}
+  if [[ -n $source_path && -r $source_path && $source_path != "/dev/stdin" && $source_path != /proc/self/fd/* ]]; then
+    install -D -m 700 "$source_path" "$MANAGER_PATH"
+  else
+    # 通过 curl ... | sudo bash 这类管道方式运行时, 脚本无法读取自身文件路径,
+    # 改为从远程仓库下载一份完整脚本安装为快捷命令。
+    info "检测到脚本通过管道方式运行 (例如 curl | bash), 正在从远程仓库下载完整脚本以安装 sb 快捷命令..."
+    local tmp
+    tmp=$(mktemp)
+    if curl -fL --proto '=https' --tlsv1.2 "$SCRIPT_UPDATE_URL" -o "$tmp" 2>/dev/null && bash -n "$tmp" 2>/dev/null; then
+      install -D -m 700 "$tmp" "$MANAGER_PATH"
+    else
+      rm -f "$tmp"
+      warn "无法下载远程脚本副本, 跳过创建快捷命令。请先将脚本保存为文件后以 'sudo bash sing-box-vps.sh install' 方式运行, 即可自动创建 sb 命令。"
+      return 0
+    fi
+    rm -f "$tmp"
+  fi
+  tee "$SHORTCUT_PATH" >/dev/null <<EOF
+#!/usr/bin/env bash
+exec ${MANAGER_PATH} "\$@"
+EOF
+  chmod 755 "$SHORTCUT_PATH"
+  ok "已创建快捷命令: sb"
+}
+
+version_ge() {
+  # version_ge <have> <need> : 语义化版本比较, 返回 0 表示 have >= need
+  [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
+}
+
+check_sing_box_min_version() {
+  command -v sing-box >/dev/null 2>&1 || return 1
+  local ver
+  ver=$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+  [[ -n $ver ]] || return 1
+  if ! version_ge "$ver" "$SB_MIN_VERSION"; then
+    warn "检测到 sing-box 版本 ${ver} 低于建议最低版本 ${SB_MIN_VERSION}, 部分特性 (如 Reality/Hysteria2/TUIC) 可能不受支持, 建议运行 'sb upgrade'。"
+    return 1
+  fi
+  return 0
+}
+
+ensure_installed() {
+  command -v sing-box >/dev/null 2>&1 || install_sing_box
+  command -v jq >/dev/null 2>&1 || install_prerequisites
+  check_sing_box_min_version || true
+  ensure_base_routing
+}
+
+create_base_config() {
+  [[ -f $CONFIG_FILE ]] && return 0
+  ensure_dirs
+  info "初始化包含 IPv4/IPv6 出站策略的基础配置"
+  local candidate
+  candidate=$(mktemp)
+    jq -n '{
+    log: { level: "info", timestamp: true },
+    dns: {
+      servers: [
+        { type: "udp", tag: "dns-direct", server: "1.1.1.1" }
+      ]
+    },
+    inbounds: [],
+    outbounds: [
+      { type: "direct", tag: "direct" },
+      { type: "direct", tag: "direct-v4",
+        domain_resolver: { server: "dns-direct", strategy: "ipv4_only" } },
+      { type: "direct", tag: "direct-v6",
+        domain_resolver: { server: "dns-direct", strategy: "ipv6_only" } },
+      { type: "direct", tag: "direct-dual",
+        domain_resolver: { server: "dns-direct", strategy: "prefer_ipv6" } }
+    ],
+    route: { rules: [], final: "direct", default_domain_resolver: "dns-direct" }
+  }' > "$candidate"
+  json_validate "$candidate" || die "内部错误: 基础配置生成失败。"
+  atomic_install "$candidate" "$CONFIG_FILE" 600
+  rm -f "$candidate"
+}
+
+ensure_base_routing() {
+  ensure_dirs
+  create_base_config
+  ensure_dns_resolver
+  ensure_route_default_resolver
+  ensure_direct_outbounds
+}
+# ---------------------------------------------------------------------------
+# 配置备份
+# ---------------------------------------------------------------------------
+backup_config() {
+  [[ -f $CONFIG_FILE ]] || return 0
+  local stamp
+  stamp=$(date +%Y%m%d-%H%M%S)
+  install -m 600 "$CONFIG_FILE" "${BACKUP_DIR}/config-${stamp}.json"
+  find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.json' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | awk 'NR>15 {print $2}' | xargs -r rm -f
+}
+
+# apply_candidate <candidate_file>
+# 校验通过 -> 备份现有生产配置 -> 原子替换 -> 重启服务
+# 校验/重启失败 -> 自动回滚到替换前的备份, 绝不让生产服务停留在坏配置上
+apply_candidate() {
+  local candidate=$1
+  json_validate "$candidate" || die "候选配置 JSON 语法非法, 已拒绝写入。"
+  if ! sing-box check -c "$candidate" 2>&1 | tee -a "$LOG_FILE"; then
+    die "候选配置未通过 sing-box check 校验, 已拒绝写入, 详见 ${LOG_FILE}。"
+  fi
+  backup_config
+  local prev_backup
+  prev_backup=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.json' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | head -n1 | cut -d' ' -f2-)
+
+  atomic_install "$candidate" "$CONFIG_FILE" 600
+  
+
+  systemctl enable --now sing-box >/dev/null 2>&1 || true
+  if ! systemctl restart sing-box; then
+    warn "sing-box 重启失败, 正在自动回滚到上一份可用配置..."
+    if [[ -n $prev_backup && -f $prev_backup ]]; then
+      atomic_install "$prev_backup" "$CONFIG_FILE" 600
+      systemctl restart sing-box || warn "回滚后仍未能启动 sing-box, 请运行 'sb logs' 排查。"
+      die "部署失败, 已回滚至变更前配置。"
+    else
+      die "部署失败且无可用备份用于回滚, 请手动检查 ${CONFIG_FILE}。"
+    fi
+  fi
+  if ! systemctl is-active --quiet sing-box; then
+    warn "sing-box 服务未处于运行状态, 正在自动回滚..."
+    if [[ -n $prev_backup && -f $prev_backup ]]; then
+      atomic_install "$prev_backup" "$CONFIG_FILE" 600
+      systemctl restart sing-box || true
+      die "部署失败, 已回滚至变更前配置。"
+    else
+      die "部署失败且无可用备份用于回滚, 请手动检查 ${CONFIG_FILE}。"
+    fi
+  fi
+}
+
+port_is_used_in_config() {
+  local port=$1
+  jq -e --argjson port "$port" '.inbounds[]? | select(.listen_port == $port)' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+ensure_port_available() {
+  local port=$1
+  if port_is_used_in_config "$port"; then
+    die "端口 $port 已在 sing-box 配置中被占用。"
+  fi
+  if command -v ss >/dev/null 2>&1 && ss -tulnH "sport = :$port" 2>/dev/null | grep -q .; then
+    die "端口 $port 已被宿主机其他进程占用, 请更换端口。"
+  fi
+}
+
+quick_reality_port() {
+  local candidate
+  for candidate in 443 8443 2053 2083 2087 2096 4433; do
+    if ! port_is_used_in_config "$candidate" && { ! command -v ss >/dev/null 2>&1 || ! ss -tulnH "sport = :$candidate" 2>/dev/null | grep -q .; }; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+check_and_handle_existing_tag() {
+  local tag=$1
+  if jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
+    warn "检测到节点标识 [${tag}] 已存在!"
+    if confirm "该节点已存在, 是否覆盖?" N; then
+      local candidate
+      candidate=$(mktemp)
+      jq --arg tag "$tag" '
+        ([.inbounds[]? | select(.tag == $tag) | .detour // empty]) as $detours |
+        .inbounds |= map(select(.tag != $tag and ((.tag | IN($detours[])) | not))) |
+        if .route.rules then .route.rules |= map(select((.inbound // []) | index($tag) | not)) else . end
+      ' "$CONFIG_FILE" > "$candidate"
+      apply_candidate "$candidate"
+      rm -f "$candidate"
+      atomic_json_update "$STATE_FILE" '.connections |= map(select(.tag != $tag))' --arg tag "$tag"
+      ok "已自动清理旧节点 [${tag}] 及其关联入站, 开始重新写入..."
+      return 0
+    fi
+    warn "操作已取消。"
+    return 1
+  fi
+  return 0
+}
+
+apply_inbound_with_route() {
+  local inbound_json=$1 tag=$2 outbound_tag=$3 candidate
+  candidate=$(mktemp)
+  jq --argjson inbound "$inbound_json" --arg tag "$tag" --arg outbound "$outbound_tag" '
+    .inbounds += [$inbound] |
+    .route.rules += [{"inbound": [$tag], "action": "route", "outbound": $outbound}]
+  ' "$CONFIG_FILE" > "$candidate"
+  PENDING_TAG=$tag
+  apply_candidate "$candidate"
+  rm -f "$candidate"
+}
+
+# ---------------------------------------------------------------------------
+# 防火墙
+# ---------------------------------------------------------------------------
+persist_iptables_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    return 0
+  fi
+  if [[ -d /etc/iptables ]]; then
+    command -v iptables-save  >/dev/null 2>&1 && iptables-save  > /etc/iptables/rules.v4 2>/dev/null
+    command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+    return 0
+  fi
+  # 尝试安装 iptables-persistent 以便规则重启后仍然生效; 静默失败不影响本次放行
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent >/dev/null 2>&1 || true
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+  fi
+}
+
+readonly NFT_TABLE="sing_box_vps"
+
+ensure_nft_table() {
+  command -v nft >/dev/null 2>&1 || return 1
+  nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && return 0
+  nft add table inet "$NFT_TABLE" 2>/dev/null || return 1
+  nft add chain inet "$NFT_TABLE" input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || return 1
+  return 0
+}
+
+persist_nft_rules() {
+  command -v nft >/dev/null 2>&1 || return 0
+  if [[ -d /etc/nftables.d ]]; then
+    nft list table inet "$NFT_TABLE" > "/etc/nftables.d/${NFT_TABLE}.nft" 2>/dev/null || true
+  elif [[ -f /etc/nftables.conf ]]; then
+    info "检测到 nftables, 规则已生效但未持久化; 如需重启后仍生效, 请自行将 'nft list table inet ${NFT_TABLE}' 的输出加入 /etc/nftables.conf。"
+  fi
+}
+
+open_firewall_port() {
+  local port=$1 protocol=${2:-tcp} handled=0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw allow "${port}/${protocol}" >/dev/null 2>&1
+    ok "已通过 UFW 放行 ${port}/${protocol}"
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-port="${port}/${protocol}" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    ok "已通过 firewalld 放行 ${port}/${protocol}"
+    return 0
+  fi  # 未检测到 UFW/firewalld 时, 不少云厂商精简镜像仍带有独立生效的 iptables/ip6tables
+  # 默认规则 (仅监听端口不代表内核放行), 这里直接对 IPv4 与 IPv6 分别插入放行规则,
+  # 这正是很多 "端口监听正常但连不通" 场景的根因, 必须两条链都处理。
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null \
+      || iptables -I INPUT -p "$protocol" --dport "$port" -j ACCEPT
+    handled=1
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -C INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null \
+      || ip6tables -I INPUT -p "$protocol" --dport "$port" -j ACCEPT
+    handled=1
+  fi
+  if (( handled == 1 )); then
+    persist_iptables_rules
+    ok "已在 iptables/ip6tables 放行 ${port}/${protocol} (若使用云厂商安全组, 仍需在控制台分别放行 IPv4 与 IPv6 规则)。"
+    return 0
+  fi
+  # 纯 nftables 系统 (无 iptables-nft 兼容层, command -v iptables 探测不到) 的兜底路径
+  if command -v nft >/dev/null 2>&1 && ensure_nft_table; then
+    nft add rule inet "$NFT_TABLE" input "${protocol}" dport "${port}" accept 2>/dev/null
+    persist_nft_rules
+    ok "已通过 nftables 放行 ${port}/${protocol} (若使用云厂商安全组, 仍需在控制台分别放行 IPv4 与 IPv6 规则)。"
+    return 0
+  fi
+  warn "未检测到 UFW/firewalld/iptables/nftables 中任何一种可用的防火墙管理工具; 请在云厂商安全组放行 ${port}/${protocol} (注意 IPv4 与 IPv6 需分别放行)。"
+}
+
+close_firewall_port() {
+  # 节点删除时对称撤销放行规则: UFW/firewalld/iptables/nftables 四种情况都要处理,
+  # 否则删除节点后端口仍然对外开放。
+  local port=$1 protocol=${2:-tcp}
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw delete allow "${port}/${protocol}" >/dev/null 2>&1 || true
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --remove-port="${port}/${protocol}" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    while iptables -C INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null; do
+      iptables -D INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || break
+    done
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    while ip6tables -C INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null; do
+      ip6tables -D INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || break
+    done
+  fi
+  if command -v nft >/dev/null 2>&1 && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    local handle
+    while handle=$(nft -a list chain inet "$NFT_TABLE" input 2>/dev/null \
+        | awk -v p="$port" -v pr="$protocol" '$0 ~ pr" dport "p" accept" {print $NF; exit}'); do
+      [[ -n $handle ]] || break
+      nft delete rule inet "$NFT_TABLE" input handle "$handle" 2>/dev/null || break
+    done
+    persist_nft_rules
+  fi
+  persist_iptables_rules
+}
+
+# ---------------------------------------------------------------------------
+# 密钥 / UUID / 随机路径生成
+# ---------------------------------------------------------------------------
+random_ss_key()  { sing-box generate rand --base64 16 2>/dev/null || openssl rand -base64 16 | tr -d '\n'; }
+random_token()   { openssl rand -hex 24; }
+random_path()    { printf '/%s' "$(openssl rand -hex 12)"; }
+new_uuid()       { sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid; }
+
+generate_reality_keypair() {
+  local keypair private_key public_key
+  keypair=$(sing-box generate reality-keypair)
+  private_key=$(awk -F': ' '/PrivateKey/ {print $2}' <<<"$keypair")
+  public_key=$(awk -F': ' '/PublicKey/ {print $2}' <<<"$keypair")
+  [[ -n $private_key && -n $public_key ]] || die "无法生成 Reality 密钥对。"
+  printf '%s|%s' "$private_key" "$public_key"
+}
+# 询问节点显示名称, 返回 URL 编码后的结果 (可直接拼进 URI 的 # 后面)
+ask_node_name() {
+  local default=$1 name
+  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '%s' "${QUICK_NAME:-$default}" | jq -sRr '@uri'; return 0; fi
+  while true; do
+    IFS= read -r -e -i "$default" -p '节点名称: ' name || true
+    name=${name:-$default}
+    if (( ${#name} <= 64 )); then
+      printf '%s' "$name" | jq -sRr '@uri'
+      return 0
+    fi
+    warn "节点名称过长 (最多 64 字符), 请重新输入。"
+  done
+}
+# Reality 握手域名: 内置推荐列表 + 自定义, 并做连通性/TLS1.3 粗校验
+ask_reality_handshake_domain() {
+  local i choice domain
+  if [[ ${QUICK_MODE:-0} == 1 ]]; then
+    domain=${QUICK_DOMAIN:-${REALITY_PRESET_DOMAINS[0]}}
+    if timeout 4 openssl s_client -connect "${domain}:443" -tls1_3 -servername "$domain" </dev/null >/dev/null 2>&1; then printf '%s' "$domain"; return 0; fi
+    die "默认 Reality 握手域名 ${domain} 未通过 TLS 1.3 探测；请改用自定义 Reality 部署。"
+  fi
+  printf "\n选择 Reality 握手伪装域名 (需支持 TLS 1.3, 建议选用大型 CDN/云厂商域名):\n" >&2
+  for i in "${!REALITY_PRESET_DOMAINS[@]}"; do
+    printf "  %d) %s\n" "$((i+1))" "${REALITY_PRESET_DOMAINS[$i]}" >&2
+  done
+  printf "  0) 自定义输入\n" >&2
+  IFS= read -r -e -p "请选择 [1]: " choice
+  choice=${choice:-1}
+  if [[ $choice == 0 ]]; then
+    domain=$(ask_required "请输入握手域名")
+  elif [[ $choice =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#REALITY_PRESET_DOMAINS[@]} )); then
+    domain=${REALITY_PRESET_DOMAINS[$((choice-1))]}
+  else
+    domain=${REALITY_PRESET_DOMAINS[0]}
+  fi
+  valid_hostname "$domain" || die "握手域名格式不正确。"
+  if command -v openssl >/dev/null 2>&1; then
+    if ! timeout 4 openssl s_client -connect "${domain}:443" -tls1_3 -servername "$domain" </dev/null >/dev/null 2>&1; then
+      warn "无法确认 ${domain} 支持 TLS 1.3 握手 (可能是网络限制), 请自行确保可用性。"
+    fi
+  fi
+  printf '%s' "$domain"
+}
+
+# ---------------------------------------------------------------------------
+# TLS 证书管理 (Certbot)
+# ---------------------------------------------------------------------------
+tls_json() {
+  local domain=$1 cert=$2 key=$3
+  jq -n --arg domain "$domain" --arg cert "$cert" --arg key "$key" \
+    '{enabled:true,server_name:$domain,alpn:["h2","http/1.1"],min_version:"1.2",certificate_path:$cert,key_path:$key}'
+}
+
+check_port_80() {
+  if command -v ss >/dev/null 2>&1 && ss -tulnH "sport = :80" 2>/dev/null | grep -q .; then
+    warn "检测到 80 端口已被其他服务占用!"
+    ss -tlpn "sport = :80" 2>/dev/null || true
+    confirm "是否继续? (如果占用者为 Web 服务, Certbot 申请可能失败)" N || die "已取消申请, 请释放 80 端口或使用已有证书。"
+  fi
+}
+
+grant_cert_access() {
+  id sing-box >/dev/null 2>&1 || return 0
+  command -v setfacl >/dev/null 2>&1 || run_with_progress "安装 ACL 工具" apt-get install -y -qq acl
+  setfacl -R -m u:sing-box:rX /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+  return 0
+}
+
+install_certbot_hook() {
+  install -d -m 755 "$(dirname "$CERT_HOOK")"
+    tee "$CERT_HOOK" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+if command -v setfacl >/dev/null 2>&1 && id sing-box >/dev/null 2>&1; then
+  setfacl -R -m u:sing-box:rX /etc/letsencrypt/live /etc/letsencrypt/archive || true
+fi
+systemctl try-restart sing-box.service
+EOF
+  chmod 755 "$CERT_HOOK"
+}
+
+obtain_tls_paths() {
+  local domain=$1 cert key choice
+  cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+  key="/etc/letsencrypt/live/${domain}/privkey.pem"
+  if [[ -r $cert && -r $key ]]; then
+    printf '%s|%s' "$cert" "$key"
+    return 0
+  fi
+  printf "\nTLS 证书获取方式:\n  1) 使用 Certbot 自动签发 Let's Encrypt (需域名解析到本机且 80 端口开放)\n  2) 使用已有 PEM 证书路径\n" >&2
+  IFS= read -r -e -p '选择 [1]: ' choice
+  choice=${choice:-1}
+  case $choice in
+    1)
+      check_port_80
+      run_with_progress "更新 APT 索引" apt-get update -qq
+      run_with_progress "安装 Certbot" apt-get install -y -qq certbot
+      open_firewall_port 80 tcp >&2
+      info "正在签发 ${domain} 证书..." >&2
+      run_with_progress "签发 ${domain} 证书" certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$domain"
+      install_certbot_hook
+      grant_cert_access >&2
+      enable_certbot_autorenew >&2
+      [[ -r $cert && -r $key ]] || die "证书文件生成失败。"
+      ;;
+    2)
+      cert=$(ask_required "证书链 fullchain PEM 绝对路径")
+      key=$(ask_required "私钥 privkey PEM 绝对路径")
+      [[ -r $cert && -r $key ]] || die "证书或私钥文件不可读。"
+      ;;
+    *) die "无效的选择。" ;;
+  esac
+  printf '%s|%s' "$cert" "$key"
+}
+
+enable_certbot_autorenew() {
+  command -v certbot >/dev/null 2>&1 || return 0
+  if systemctl list-timers --all 2>/dev/null | grep -q certbot; then
+    systemctl enable --now certbot.timer >/dev/null 2>&1 || true
+  else
+    # 部分发行版无内建 timer, 补一个每日随机时间的 cron
+    local cronfile="/etc/cron.d/sing-box-vps-certbot"
+    tee "$cronfile" >/dev/null <<'EOF'
+SHELL=/bin/bash
+17 3 * * * root certbot renew --quiet --deploy-hook "systemctl try-restart sing-box.service"
+EOF
+    chmod 644 "$cronfile"
+  fi
+  ok "已启用 Certbot 自动续期。"
+}
+
+show_certificate_expiry() {
+  ensure_installed
+  local cert_path end_date
+  local -a certs=()
+  mapfile -t certs < <(jq -r '.inbounds[]? | .tls.certificate_path? // empty' "$CONFIG_FILE" | sort -u)
+  if (( ${#certs[@]} == 0 )); then
+    warn "当前配置中没有使用本地证书文件的 TLS 入站。"
+    return 0
+  fi
+  printf '\n证书到期时间统计:\n'
+  for cert_path in "${certs[@]}"; do
+    if [[ -r $cert_path ]]; then
+      end_date=$(openssl x509 -enddate -noout -in "$cert_path" | cut -d= -f2-)
+      printf -- '- %s\n  到期时间: %s\n' "$cert_path" "$end_date"
+    else
+      warn "证书文件不可读: $cert_path"
+    fi
+  done
+}
+
+renew_certificate_now() {
+  require_cmd certbot
+  local domain
+  domain=$(ask_required "要立即续期/重新申请的域名")
+  valid_hostname "$domain" || die "域名格式不正确。"
+  check_port_80
+  open_firewall_port 80 tcp
+  run_with_progress "续签 ${domain} 证书" certbot certonly --standalone --non-interactive --agree-tos --force-renewal \
+    --register-unsafely-without-email -d "$domain"
+  install_certbot_hook
+  grant_cert_access
+  systemctl try-restart sing-box || true
+  ok "证书已重新签发: ${domain}"
+}
+
+cert_management_menu() {
+  local choice
+  while true; do
+    title "证书管理"
+    printf '  1) 查看证书到期时间\n'
+    printf '  2) 立即续期 / 重新申请证书\n'
+    printf '  3) 启用/检查 Certbot 自动续期\n'
+    printf '  0) 返回主菜单\n'
+    IFS= read -r -e -p '请选择: ' choice
+    case $choice in
+      1) show_certificate_expiry ;;
+      2) renew_certificate_now ;;
+      3) enable_certbot_autorenew ;;
+      0) return 0 ;;
+      *) warn "无效的编号选择。" ;;
+    esac
+  done
+}
+# ---------------------------------------------------------------------------
+# 连接记录存取
+# ---------------------------------------------------------------------------
+save_connection() {
+  local type=$1 tag=$2 host=$3 port=$4 uri=$5
+  atomic_json_update "$STATE_FILE" \
+    '.connections += [{type:$type, tag:$tag, host:$host, port:($port|tonumber), uri:$uri, created_at:(now|strftime("%Y-%m-%dT%H:%M:%SZ"))}]' \
+    --arg type "$type" --arg tag "$tag" --arg host "$host" --arg port "$port" --arg uri "$uri" \
+    || die "保存连接记录失败。"
+}
+
+# ---------------------------------------------------------------------------
+# 二维码输出
+# ---------------------------------------------------------------------------
+osc52_copy() {
+  local data=$1 b64
+  b64=$(printf '%s' "$data" | base64 | tr -d '\r\n')
+  if [[ -n ${TMUX:-} ]]; then printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64"
+  elif [[ -n ${STY:-} ]]; then printf '\033P\033]52;c;%s\a\033\\' "$b64"
+  else printf '\033]52;c;%s\a' "$b64"; fi
+}
+
+print_uri_preview() {
+  local uri=$1 cols=${COLUMNS:-80} limit
+  if (( cols < 60 )); then limit=48; elif (( cols < 100 )); then limit=76; else limit=120; fi
+  if (( ${#uri} > limit )); then printf '%s… [已截断；选 p 查看完整链接]\n' "${uri:0:limit}"; else printf '%s\n' "$uri"; fi
+}
+
+show_qrcode() {
+  local uri=$1 tag=${2:-node}
+  if ! command -v qrencode >/dev/null 2>&1; then
+    apt-get install -y -qq qrencode >/dev/null 2>&1 || true
+  fi
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '\n'
+    local cols=${COLUMNS:-80}
+    if (( cols >= 60 )); then
+      qrencode -t ANSIUTF8 -m 1 <<<"$uri"
+    else
+      info "窄终端跳过二维码字符渲染。"
+    fi
+    qrencode -t PNG -o "${QR_CACHE_DIR}/${tag}.png" -m 1 <<<"$uri" 2>/dev/null || true
+    (( cols < 60 )) && info "二维码 PNG: ${QR_CACHE_DIR}/${tag}.png"
+  else
+    warn "qrencode 未安装, 已跳过二维码渲染。"
+  fi
+}
+
+print_result_block() {
+  local title=$1 uri=$2 tag=$3
+  PENDING_TAG=""
+  printf '\n%s 客户端连接串:\n' "$title"
+  print_uri_preview "$uri"
+  local action=''
+  IFS= read -r -e -p '操作: [回车]继续 / c复制 / p完整链接 / q二维码: ' action || true
+  case $action in
+    c) osc52_copy "$uri"; info "已发送 OSC 52 复制请求；若终端不支持，请选 p 显示完整链接。" ;;
+    p) printf '%s\n' "$uri" ;;
+    q) show_qrcode "$uri" "$tag" ;;
+  esac
+  show_qrcode "$uri" "$tag"
+  printf '\n'
+  info "正在自动刷新订阅文件..."
+  sub_build_all || warn "订阅文件自动刷新失败, 可稍后运行 'sb sub' 手动刷新。"
+  printf '\n'
+  IFS= read -r -e -p "按回车键继续 (可先复制/截图上面的连接串或二维码)..." _ || true
+}
+
+# ---------------------------------------------------------------------------
+# 通用: 依据网络模式准备端口/监听/出站/tag 的前置流程
+# deploy_prepare <label> <default_port> <tag_prefix> -> 通过全局变量返回
+#   D_MODE D_LISTEN D_OUTBOUND D_PORT D_TAG D_HOST D_FORMATTED_HOST
+# ---------------------------------------------------------------------------
+declare -g D_MODE D_LISTEN D_OUTBOUND D_PORT D_TAG D_HOST D_FORMATTED_HOST
+
+deploy_prepare_common() {
+  local port_label=$1 default_port=$2 tag_prefix=$3 fixed_mode=${4:-}
+  ensure_installed
+  if [[ -n $fixed_mode ]]; then
+    D_MODE=$fixed_mode
+    case "$D_MODE" in
+      v4) check_ipv4_egress || die "系统检测到 IPv4 外网不可用, 无法部署 IPv4 专用节点。" ;;
+      v6) check_ipv6_egress || die "系统检测到 IPv6 外网不可用, 无法部署 IPv6 节点。" ;;
+    esac
+  else
+    D_MODE=$(ask_node_network_mode)
+  fi
+  D_LISTEN=$(mode_listen_addr "$D_MODE")
+  D_OUTBOUND=$(mode_outbound_tag "$D_MODE")
+  if [[ ${QUICK_MODE:-0} == 1 ]]; then
+    D_PORT=${QUICK_PORT:-$(quick_reality_port)} || die "未找到可用的快速部署端口。"
+  else D_PORT=$(ask_port "$port_label" "$default_port"); fi
+  D_TAG="${tag_prefix}-${D_MODE}-${D_PORT}"
+  check_and_handle_existing_tag "$D_TAG" || return 1
+  ensure_port_available "$D_PORT"
+  if [[ ${QUICK_MODE:-0} == 1 ]]; then
+    local cached_ips
+    cached_ips=$(get_cached_public_ips); D_HOST=${QUICK_HOST:-${cached_ips%%|*}}
+    [[ -n $D_HOST ]] || D_HOST=$(detect_public_ipv6)
+    [[ -n $D_HOST ]] || die "无法自动探测公网连接地址。"
+  else D_HOST=$(ask_node_server "$D_MODE"); fi
+  D_FORMATTED_HOST=$(format_host_uri "$D_HOST")
+  return 0
+}
+
+# 需要 TLS 域名(而非仅 Reality 握手伪装)的协议共用的域名+证书前置流程
+deploy_prepare_tls_domain() {
+  local default_port=$1 tag_prefix=$2
+  D_MODE=$(ask_node_network_mode)
+  D_LISTEN=$(mode_listen_addr "$D_MODE")
+  D_OUTBOUND=$(mode_outbound_tag "$D_MODE")
+  D_HOST=$(ask_hostname "TLS 绑定域名")
+  D_FORMATTED_HOST=$(format_host_uri "$D_HOST")
+  D_PORT=$(ask_port "监听端口" "$default_port")
+  D_TAG="${tag_prefix}-${D_MODE}-${D_PORT}"
+  check_and_handle_existing_tag "$D_TAG" || return 1
+  ensure_port_available "$D_PORT"
+  return 0
+}
+
+# ===========================================================================
+# 协议部署函数
+# ===========================================================================
+
+deploy_vless_reality_unified() {
+  local mode=${1:-}
+  local step_started=$SECONDS
+  ensure_installed
+  deploy_prepare_common "VLESS Reality 监听端口" 443 "reality" "$mode" || return 0
+  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '✓ 环境、端口与地址准备 (%ss)\n' "$((SECONDS-step_started))"; fi
+
+  local handshake keypair private_key public_key short_id uuid reality tls inbound uri flag
+  step_started=$SECONDS
+  handshake=$(ask_reality_handshake_domain)
+  keypair=$(generate_reality_keypair)
+  private_key=${keypair%%|*}; public_key=${keypair#*|}
+  short_id=$(openssl rand -hex 4)
+  uuid=$(new_uuid)
+  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '✓ 握手域名检查与凭据生成 (%ss)\n' "$((SECONDS-step_started))"; fi
+
+  reality=$(jq -n --arg handshake "$handshake" --arg private_key "$private_key" --arg short_id "$short_id" \
+    '{enabled:true,handshake:{server:$handshake,server_port:443},private_key:$private_key,short_id:[$short_id]}')
+  tls=$(jq -n --arg handshake "$handshake" --argjson reality "$reality" '{enabled:true,server_name:$handshake,reality:$reality}')
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg uuid "$uuid" --argjson tls "$tls" \
+    '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",uuid:$uuid,flow:"xtls-rprx-vision"}],tls:$tls}')
+  local node_name; node_name=$(ask_node_name "Reality-${D_MODE}")
+  flag=$(get_server_flag)
+  step_started=$SECONDS
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"  
+  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '✓ 配置校验、备份与写入 (%ss)\n' "$((SECONDS-step_started))"; fi
+  uri="vless://${uuid}@${D_FORMATTED_HOST}:${D_PORT}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=${handshake}&fp=chrome&pbk=${public_key}&sid=${short_id}#${flag}%20${node_name}"
+  step_started=$SECONDS
+  save_connection "vless-reality-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp
+  if [[ ${QUICK_MODE:-0} == 1 ]]; then printf '✓ 连接记录与防火墙 (%ss)\n' "$((SECONDS-step_started))"; fi
+  ok "VLESS Reality (${D_MODE}) 已成功部署 (绑定出口: ${D_OUTBOUND})"
+  print_result_block "VLESS Reality" "$uri" "$D_TAG"
+}
+
+deploy_vless_reality_grpc() {
+  ensure_installed
+  deploy_prepare_common "VLESS Reality gRPC 监听端口" 8443 "reality-grpc" || return 0
+
+  local handshake keypair private_key public_key short_id uuid service_name reality tls inbound uri flag
+  handshake=$(ask_reality_handshake_domain)
+  service_name="grpc-$(openssl rand -hex 4)"
+  keypair=$(generate_reality_keypair)
+  private_key=${keypair%%|*}; public_key=${keypair#*|}
+  short_id=$(openssl rand -hex 4)
+  uuid=$(new_uuid)
+
+  reality=$(jq -n --arg handshake "$handshake" --arg private_key "$private_key" --arg short_id "$short_id" \
+    '{enabled:true,handshake:{server:$handshake,server_port:443},private_key:$private_key,short_id:[$short_id]}')
+  tls=$(jq -n --arg handshake "$handshake" --argjson reality "$reality" '{enabled:true,server_name:$handshake,reality:$reality}')
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg uuid "$uuid" --arg svc "$service_name" --argjson tls "$tls" \
+    '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",uuid:$uuid}],tls:$tls,transport:{type:"grpc",service_name:$svc}}')
+  local node_name; node_name=$(ask_node_name "Reality-gRPC-${D_MODE}")
+  flag=$(get_server_flag)
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+  uri="vless://${uuid}@${D_FORMATTED_HOST}:${D_PORT}?encryption=none&security=reality&type=grpc&serviceName=${service_name}&mode=gun&sni=${handshake}&fp=chrome&pbk=${public_key}&sid=${short_id}#${flag}%20${node_name}"
+  save_connection "vless-reality-grpc-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp
+  ok "VLESS Reality gRPC (${D_MODE}) 已部署"
+  print_result_block "VLESS Reality gRPC" "$uri" "$D_TAG"
+}
+
+deploy_shadowtls_ss2022() {
+  ensure_installed
+  deploy_prepare_common "ShadowTLS 公网监听端口" 443 "st3" || return 0
+
+  local handshake st_password ss_key tag_ss inbound_st inbound_ss candidate encoded_ss uri flag
+  handshake=$(ask_reality_handshake_domain)
+  tag_ss="ss-inner-${D_PORT}"
+  st_password=$(random_token)
+  ss_key=$(random_ss_key)
+
+  inbound_st=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg pwd "$st_password" --arg hs "$handshake" --arg detour "$tag_ss" \
+    '{type:"shadowtls",tag:$tag,listen:$listen,listen_port:$port,version:3,users:[{password:$pwd}],handshake:{server:$hs,server_port:443},strict_mode:true,detour:$detour}')
+  inbound_ss=$(jq -n --arg tag "$tag_ss" --arg key "$ss_key" \
+    '{type:"shadowsocks",tag:$tag,method:"2022-blake3-aes-128-gcm",password:$key}')
+
+  candidate=$(mktemp)
+  jq --argjson inb_st "$inbound_st" --argjson inb_ss "$inbound_ss" --arg tag "$D_TAG" --arg outbound "$D_OUTBOUND" '
+    .inbounds += [$inb_st, $inb_ss] |
+    .route.rules += [{"inbound": [$tag], "action": "route", "outbound": $outbound}]
+  ' "$CONFIG_FILE" > "$candidate"
+  local node_name; node_name=$(ask_node_name "ShadowTLS-SS2022-${D_MODE}")
+  flag=$(get_server_flag)
+  PENDING_TAG="$D_TAG"
+  apply_candidate "$candidate"  
+  rm -f "$candidate"
+  encoded_ss=$(printf '%s' "2022-blake3-aes-128-gcm:${ss_key}" | base64 -w 0)
+  uri="ss://${encoded_ss}@${D_FORMATTED_HOST}:${D_PORT}?plugin=shadow-tls%3Bhost%3D${handshake}%3Bpassword%3D${st_password}%3Bversion%3D3#${flag}%20${node_name}"
+  save_connection "shadowtls-v3-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp
+  ok "ShadowTLS v3 + SS2022 (${D_MODE}) 已部署"
+  print_result_block "ShadowTLS v3 + SS2022" "$uri" "$D_TAG"
+}
+
+deploy_shadowsocks() {
+  ensure_installed
+  deploy_prepare_common "Shadowsocks 2022 监听端口" 8443 "ss2022" || return 0
+
+  local key inbound encoded uri flag
+  key=$(random_ss_key)
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg key "$key" \
+    '{type:"shadowsocks",tag:$tag,listen:$listen,listen_port:$port,method:"2022-blake3-aes-128-gcm",password:$key,multiplex:{enabled:true}}')
+  local node_name; node_name=$(ask_node_name "SS2022-${D_MODE}")
+  flag=$(get_server_flag)
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+  encoded=$(printf '%s' "2022-blake3-aes-128-gcm:${key}" | base64 -w 0)  
+  uri="ss://${encoded}@${D_FORMATTED_HOST}:${D_PORT}#${flag}%20${node_name}"
+  save_connection "shadowsocks-2022-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp
+  open_firewall_port "$D_PORT" udp
+  ok "Shadowsocks 2022 (${D_MODE}) 已部署"
+  print_result_block "Shadowsocks 2022" "$uri" "$D_TAG"
+}
+
+deploy_trojan() {
+  ensure_installed
+  deploy_prepare_tls_domain 443 "trojan" || return 0
+
+  local paths cert key password tls inbound uri flag
+  paths=$(obtain_tls_paths "$D_HOST")
+  cert=${paths%%|*}; key=${paths#*|}
+  password=$(random_token)
+
+  tls=$(tls_json "$D_HOST" "$cert" "$key")
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg password "$password" --argjson tls "$tls" \
+    '{type:"trojan",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",password:$password}],tls:$tls}')
+  local node_name; node_name=$(ask_node_name "Trojan-${D_MODE}")
+  flag=$(get_server_flag)
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+  uri="trojan://${password}@${D_FORMATTED_HOST}:${D_PORT}?security=tls&sni=${D_HOST}&type=tcp#${flag}%20${node_name}"
+  save_connection "trojan-tls-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp
+  ok "Trojan TLS (${D_MODE}) 已部署"
+  print_result_block "Trojan TLS" "$uri" "$D_TAG"
+}
+
+deploy_vless() {
+  ensure_installed
+  deploy_prepare_tls_domain 8443 "vless" || return 0
+
+  local paths cert key uuid tls inbound uri flag
+  paths=$(obtain_tls_paths "$D_HOST")
+  cert=${paths%%|*}; key=${paths#*|}
+  uuid=$(new_uuid)
+
+  tls=$(tls_json "$D_HOST" "$cert" "$key")
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg uuid "$uuid" --argjson tls "$tls" \
+    '{type:"vless",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",uuid:$uuid}],tls:$tls}')
+  local node_name; node_name=$(ask_node_name "VLESS-${D_MODE}")
+  flag=$(get_server_flag)
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+  uri="vless://${uuid}@${D_FORMATTED_HOST}:${D_PORT}?encryption=none&security=tls&type=tcp&sni=${D_HOST}#${flag}%20${node_name}"
+  save_connection "vless-tls-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp
+  ok "VLESS TLS (${D_MODE}) 已部署"
+  print_result_block "VLESS TLS" "$uri" "$D_TAG"
+}
+
+deploy_hysteria2() {
+  ensure_installed
+  deploy_prepare_tls_domain 8443 "hy2" || return 0
+
+  local paths cert key password obfs_password tls inbound uri flag
+  paths=$(obtain_tls_paths "$D_HOST")
+  cert=${paths%%|*}; key=${paths#*|}
+  password=$(random_token)
+  obfs_password=$(random_token)
+
+  tls=$(tls_json "$D_HOST" "$cert" "$key")
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg password "$password" --arg obfs "$obfs_password" --argjson tls "$tls" \
+    '{type:"hysteria2",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",password:$password}],obfs:{type:"salamander",password:$obfs},tls:$tls}')
+  local node_name; node_name=$(ask_node_name "Hysteria2-${D_MODE}")
+  flag=$(get_server_flag)
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+  uri="hysteria2://${password}@${D_FORMATTED_HOST}:${D_PORT}?sni=${D_HOST}&obfs=salamander&obfs-password=${obfs_password}#${flag}%20${node_name}"
+  save_connection "hysteria2-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" udp
+  ok "Hysteria2 (${D_MODE}) 已部署"
+  print_result_block "Hysteria2" "$uri" "$D_TAG"
+}
+
+deploy_tuic() {
+  ensure_installed
+  deploy_prepare_tls_domain 8443 "tuic" || return 0
+
+  local paths cert key uuid password tls inbound uri flag
+  paths=$(obtain_tls_paths "$D_HOST")
+  cert=${paths%%|*}; key=${paths#*|}
+  uuid=$(new_uuid)
+  password=$(random_token)
+
+  tls=$(tls_json "$D_HOST" "$cert" "$key")
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg uuid "$uuid" --arg password "$password" --argjson tls "$tls" \
+    '{type:"tuic",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",uuid:$uuid,password:$password}],congestion_control:"bbr",zero_rtt_handshake:false,tls:$tls}')
+  local node_name; node_name=$(ask_node_name "TUIC-${D_MODE}")
+  flag=$(get_server_flag)
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+  uri="tuic://${uuid}:${password}@${D_FORMATTED_HOST}:${D_PORT}?congestion_control=bbr&sni=${D_HOST}#${flag}%20${node_name}"
+  save_connection "tuic-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" udp
+  ok "TUIC (${D_MODE}) 已部署"
+  print_result_block "TUIC" "$uri" "$D_TAG"
+}
+
+deploy_anytls() {
+  ensure_installed
+  deploy_prepare_tls_domain 8443 "anytls" || return 0
+
+  local paths cert key password tls inbound uri flag node_name
+  paths=$(obtain_tls_paths "$D_HOST")
+  cert=${paths%%|*}; key=${paths#*|}
+  password=$(random_token)
+  node_name=$(ask_node_name "AnyTLS-${D_MODE}")
+
+  tls=$(tls_json "$D_HOST" "$cert" "$key" | jq -c 'del(.alpn)')
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg password "$password" --argjson tls "$tls" \
+    '{type:"anytls",tag:$tag,listen:$listen,listen_port:$port,users:[{name:"default",password:$password}],tls:$tls}')
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+
+  flag=$(get_server_flag)
+  uri="anytls://${password}@${D_FORMATTED_HOST}:${D_PORT}?sni=${D_HOST}#${flag}%20${node_name}"
+  save_connection "anytls-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp
+  ok "AnyTLS (${D_MODE}) 已部署"
+  print_result_block "AnyTLS" "$uri" "$D_TAG"
+}
+
+# Newer sing-box features require a hard version gate.
+require_sb_feature_version() {
+  local need=$1 feature=$2 have
+  have=$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+  [[ -n $have ]] || die "无法获取 sing-box 版本号, 请先运行 'sb check'。"
+  version_ge "$have" "$need" || die "${feature}需要 sing-box >= ${need}, 当前为 ${have}; 请运行 'sb upgrade'。"
+}
+
+ask_snell_version() {
+  local choice
+  printf '\n选择 Snell 协议版本:\n  1) v6 (推荐)\n  2) v5 (兼容旧客户端)\n' >&2
+  IFS= read -r -e -p '请选择 [1]: ' choice
+  choice=${choice:-1}
+  [[ $choice == 2 ]] && printf '5' || printf '6'
+}
+
+deploy_naive() {
+  ensure_installed
+  deploy_prepare_tls_domain 443 "naive" || return 0
+  local paths cert key username password tls inbound uri flag node_name
+  paths=$(obtain_tls_paths "$D_HOST"); cert=${paths%%|*}; key=${paths#*|}
+  username=user; password=$(random_token); node_name=$(ask_node_name "Naive-${D_MODE}")
+  tls=$(tls_json "$D_HOST" "$cert" "$key")
+  inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg username "$username" --arg password "$password" --argjson tls "$tls" '{type:"naive",tag:$tag,listen:$listen,listen_port:$port,users:[{username:$username,password:$password}],tls:$tls}')
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+  flag=$(get_server_flag); uri="naive+https://${username}:${password}@${D_FORMATTED_HOST}:${D_PORT}?padding=true#${flag}%20${node_name}"
+  save_connection "naive-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp; open_firewall_port "$D_PORT" udp
+  ok "NaiveProxy (${D_MODE}) 已部署"; print_result_block "NaiveProxy" "$uri" "$D_TAG"
+}
+
+deploy_snell() {
+  ensure_installed
+  require_sb_feature_version "1.14.0" "Snell 协议"
+  deploy_prepare_common "Snell 监听端口" 8388 "snell" || return 0
+  local version psk inbound uri uri_query flag node_name
+  version=$(ask_snell_version); psk=$(random_token); node_name=$(ask_node_name "Snell-${D_MODE}")
+  if [[ $version == 6 ]]; then
+    inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg psk "$psk" '{type:"snell",tag:$tag,listen:$listen,listen_port:$port,version:6,psk:$psk,mode:"default"}')
+  else
+    inbound=$(jq -n --arg tag "$D_TAG" --arg listen "$D_LISTEN" --argjson port "$D_PORT" --arg psk "$psk" '{type:"snell",tag:$tag,listen:$listen,listen_port:$port,version:5,psk:$psk,obfs_mode:"none"}')
+  fi
+  apply_inbound_with_route "$inbound" "$D_TAG" "$D_OUTBOUND"
+  flag=$(get_server_flag); uri_query="psk=${psk}&version=${version}"
+  uri="snell://${D_FORMATTED_HOST}:${D_PORT}?${uri_query}#${flag}%20${node_name}"
+  save_connection "snell-v${version}-${D_MODE}" "$D_TAG" "$D_HOST" "$D_PORT" "$uri"
+  open_firewall_port "$D_PORT" tcp
+  ok "Snell v${version} (${D_MODE}) 已部署"; print_result_block "Snell v${version}" "$uri" "$D_TAG"
+}
+
+# ===========================================================================
+# Cloudflare Tunnel (config.yml + ingress, 而非仅 quick "service install")
+# ===========================================================================
+readonly CF_TUNNEL_STATE="${STATE_DIR}/cf_tunnel.json"
+
+cf_state_init() {
+  ensure_dirs
+  [[ -f $CF_TUNNEL_STATE ]] || printf '{"tunnels":[]}\n' > "$CF_TUNNEL_STATE"
+}
+
+install_cloudflared() {
+  info "安装 cloudflared（自动检测最佳方式）"
+
+  # 方式一：尝试直接下载二进制（最可靠，跳过 APT 源问题）
+  local arch bin_url tmp_bin
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64)  bin_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+    aarch64) bin_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+    armv7l)  bin_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm" ;;
+    *)       bin_url="" ;;
+  esac
+
+  if [[ -n "$bin_url" ]]; then
+    tmp_bin=$(mktemp)
+    if curl -fsSL --retry 3 --connect-timeout 15 "$bin_url" -o "$tmp_bin" 2>/dev/null; then
+      install -m 755 "$tmp_bin" /usr/local/bin/cloudflared
+      rm -f "$tmp_bin"
+      info "cloudflared 二进制安装成功: $(cloudflared --version)"
+      install -d -m 700 "$CF_CONFIG_DIR" "$CF_CRED_DIR"
+      return 0
+    fi
+    rm -f "$tmp_bin"
+    warn "二进制下载失败，尝试 APT 源方式..."
+  fi
+
+  # 方式二：APT 源（修复 GPG 密钥格式问题）
+  require_apt
+  info "配置 Cloudflare 官方 cloudflared APT 源"
+  install -d -m 755 /usr/share/keyrings
+
+  # Cloudflare 已将官方签名密钥从旧的 cloudflare-main.gpg 迁移到
+  # cloudflare-public-v2.gpg (旧密钥文件对应的 key id 已不再对仓库生效,
+  # 继续使用旧文件会导致 apt-get update 报 NO_PUBKEY), 这里改用现行密钥文件名,
+  # 并保留格式探测逻辑作为兜底 (官方该文件目前是已经 dearmor 过的二进制格式,
+  # 不应再对其执行 gpg --dearmor, 否则会得到损坏的 keyring)。
+  local tmp_gpg
+  tmp_gpg=$(mktemp)
+  if curl -fsSL --retry 3 --connect-timeout 15 \
+      https://pkg.cloudflare.com/cloudflare-public-v2.gpg -o "$tmp_gpg"; then
+    # 判断是否已是二进制格式，若是 ASCII armor 则转换
+    if file "$tmp_gpg" 2>/dev/null | grep -qi "PGP public key block\|ASCII"; then
+      gpg --dearmor < "$tmp_gpg" > /usr/share/keyrings/cloudflare-public-v2.gpg
+    else
+      install -m 644 "$tmp_gpg" /usr/share/keyrings/cloudflare-public-v2.gpg
+    fi
+    rm -f "$tmp_gpg"
+  else
+    rm -f "$tmp_gpg"
+    die "无法下载 Cloudflare GPG 密钥，请检查网络连接"
+  fi
+  # 清理可能残留的旧密钥文件, 避免和新文件混淆
+  rm -f /usr/share/keyrings/cloudflare-main.gpg
+
+  tee /etc/apt/sources.list.d/cloudflared.list >/dev/null <<'EOF'
+deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main
+EOF
+
+  run_with_progress "更新 cloudflared APT 索引" apt-get update -qq
+  run_with_progress "安装 cloudflared" apt-get install -y -qq cloudflared
+  install -d -m 700 "$CF_CONFIG_DIR" "$CF_CRED_DIR"
+}
+
+ensure_cloudflared_installed() {
+  command -v cloudflared >/dev/null 2>&1 || install_cloudflared
+  install -d -m 700 "$CF_CONFIG_DIR" "$CF_CRED_DIR"
+}
+
+# 使用 config.yml + ingress 规则的正式部署方式 (而非裸 quick tunnel)
+deploy_cloudflare_tunnel() {
+  ensure_installed
+  ensure_cloudflared_installed
+  cf_state_init
+
+  local domain port path path_encoded uuid tag inbound candidate uri flag
+  local tunnel_id tunnel_name cred_file tunnel_token use_token
+
+  domain=$(ask_hostname "Cloudflare 托管域名 (例如 cf.example.com)")
+  port=$(ask_port "本地 VLESS WebSocket 端口 (仅监听 127.0.0.1)" 10000)
+  tag="vless-ws-cf-${port}"
+  check_and_handle_existing_tag "$tag" || return 0
+  ensure_port_available "$port"
+  path=$(random_path)
+  uuid=$(new_uuid)
+
+  printf "\nTunnel 接入方式:\n" >&2
+  printf "  1) 已在 Zero Trust 后台创建 Tunnel 并拿到 Token (推荐, 快速接入)\n" >&2
+  printf "  2) 使用 cloudflared tunnel create 在本机新建 Tunnel (需已 cloudflared login)\n" >&2
+  IFS= read -r -e -p "请选择 [1]: " use_token
+  use_token=${use_token:-1}
+
+    if [[ $use_token == 1 ]]; then
+    printf '\n%s\n' "---------------- Token 模式操作指引 ----------------"
+    printf ' 1. 打开 Cloudflare Zero Trust → Networks → Tunnels\n'
+    printf ' 2. 创建 Tunnel (Cloudflared 类型), 复制安装命令里 "install" 后面那串 Token\n'
+    printf ' 3. 该 Tunnel 的 Public Hostname 稍后按本脚本提示添加 (不要提前乱填)\n'
+    printf '%s\n\n' "----------------------------------------------------"
+    read -r -s -p "Cloudflare Tunnel Token (输入不回显): " tunnel_token
+    printf '\n'
+    [[ -n $tunnel_token ]] || die "Tunnel Token 不能为空。"
+    cloudflared service uninstall >/dev/null 2>&1 || true   # 已装过会报错, 先清掉
+    info "注册并启动 cloudflared 系统服务 (token 模式)..."
+    cloudflared service install "$tunnel_token"
+    tunnel_name="token-${port}"
+
+    printf '\n%s\n' "======== 现在请到 Cloudflare 后台添加 Public Hostname ========"
+    printf '  Subdomain / Domain : %s\n' "$domain"
+    printf '  Path               : (留空)\n'
+    printf '  Service Type       : HTTP\n'
+    printf '  URL                : 127.0.0.1:%s\n' "$port"
+    printf '  注意: 类型必须选 HTTP (不是 HTTPS), WebSocket 默认已开启, 无需额外设置\n'
+    printf '%s\n\n' "==============================================================="
+    IFS= read -r -e -p "添加完成后按回车继续..." _ || true
+  else
+    require_cmd cloudflared
+    [[ -f /root/.cloudflared/cert.pem || -f "${HOME}/.cloudflared/cert.pem" ]] || {
+      warn "未检测到 cloudflared 登录凭证。"
+      info "请在浏览器完成授权: 即将执行 'cloudflared tunnel login'"
+      cloudflared tunnel login
+    }
+    tunnel_name="sbvps-$(openssl rand -hex 3)"
+    cloudflared tunnel create "$tunnel_name" | tee /tmp/cf_tunnel_create.out
+    tunnel_id=$(awk -F'[()]' '/Created tunnel/ {print $0}' /tmp/cf_tunnel_create.out | grep -oE '[0-9a-f-]{36}' | head -n1)
+    [[ -n $tunnel_id ]] || tunnel_id=$(cloudflared tunnel list -o json 2>/dev/null | jq -r --arg n "$tunnel_name" '.[] | select(.name==$n) | .id' | head -n1)
+    [[ -n $tunnel_id ]] || die "无法解析新建 Tunnel 的 ID。"
+    cred_file=$(find /root/.cloudflared "${HOME}/.cloudflared" -maxdepth 1 -name "${tunnel_id}.json" 2>/dev/null | head -n1)
+    [[ -n $cred_file ]] || die "未找到 Tunnel 凭证文件 ${tunnel_id}.json。"
+    install -m 600 "$cred_file" "${CF_CRED_DIR}/${tunnel_id}.json"
+
+    cloudflared tunnel route dns "$tunnel_name" "$domain" || warn "自动创建 DNS 记录失败, 请手动在 Cloudflare 后台添加 CNAME。"
+
+    local candidate_yml
+    candidate_yml=$(mktemp)
+    cat > "$candidate_yml" <<EOF
+tunnel: ${tunnel_id}
+credentials-file: ${CF_CRED_DIR}/${tunnel_id}.json
+ingress:
+  - hostname: ${domain}
+    service: http://127.0.0.1:${port}
+  - service: http_status:404
+EOF
+    atomic_install "$candidate_yml" "$CF_CONFIG_FILE" 600
+    rm -f "$candidate_yml"
+
+    tee /etc/systemd/system/cloudflared.service >/dev/null <<EOF
+[Unit]
+Description=cloudflared (sing-box-vps managed)
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/cloudflared --config ${CF_CONFIG_FILE} tunnel run ${tunnel_id}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+  fi
+
+  systemctl enable --now cloudflared
+  sleep 2
+  systemctl is-active --quiet cloudflared || die "cloudflared 服务启动失败, 请检查 journalctl -u cloudflared。"
+
+  inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg path "$path" \
+    '{type:"vless",tag:$tag,listen:"127.0.0.1",listen_port:$port,users:[{name:"default",uuid:$uuid}],transport:{type:"ws",path:$path}}')
+  candidate=$(mktemp)
+  jq --argjson inbound "$inbound" '.inbounds += [$inbound]' "$CONFIG_FILE" > "$candidate"
+  PENDING_TAG="$tag"
+  apply_candidate "$candidate"
+  rm -f "$candidate"
+
+  atomic_json_update "$CF_TUNNEL_STATE" \
+    '.tunnels += [{name:$name, domain:$domain, port:($port|tonumber), tag:$tag, created_at:(now|strftime("%Y-%m-%dT%H:%M:%SZ")), install_method:$method}]' \
+    --arg name "$tunnel_name" --arg domain "$domain" --arg port "$port" --arg tag "$tag" \
+    --arg method "$(_cloudflared_install_method)" || true
+
+  path_encoded=$(jq -nr --arg path "$path" '$path | @uri')
+  local node_name; node_name=$(ask_node_name "CF-Tunnel")
+  flag=$(get_server_flag)
+  uri="vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${path_encoded}&sni=${domain}#${flag}%20${node_name}"
+  save_connection "vless-ws-cloudflare-tunnel" "$tag" "$domain" 443 "$uri"
+  PENDING_TAG=""
+    info "等待隧道生效并做连通性自检..."
+  sleep 3
+  local code
+  code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' "https://${domain}${path}" || true)
+  case $code in
+    400|426|101) ok "隧道链路正常 (HTTP ${code}: 服务端已响应, 只是拒绝了非 WebSocket 请求, 属正常现象)。" ;;
+    502|530|000) warn "HTTP ${code}: 隧道未接通。检查: ① 后台 Public Hostname 是否指向 127.0.0.1:${port}; ② 'sb cftunnel' 里看 cloudflared 状态与日志。" ;;
+    404)         warn "HTTP 404: 请求到了 Cloudflare 但没命中本机服务。检查后台 Service 的 URL 端口是否是 ${port}。" ;;
+    *)           info "自检返回 HTTP ${code}, 请用客户端实测。" ;;
+  esac
+  ok "Cloudflare Tunnel 与本地 VLESS WS 部署完成"
+  info "客户端提示: 地址=${domain} 端口=443 TLS 开启 传输=ws 路径=${path}"
+  print_result_block "Cloudflare Tunnel + VLESS WS" "$uri" "$tag"
+}
+
+cf_tunnel_status() {
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    warn "cloudflared 尚未安装。"
+    return 0
+  fi
+  cloudflared --version
+  systemctl --no-pager --full status cloudflared || true
+    if [[ -f $CF_CONFIG_FILE ]]; then
+    printf '\n当前 ingress 配置:\n'
+    cat "$CF_CONFIG_FILE"
+  fi
+}
+
+cf_tunnel_logs() { journalctl -u cloudflared -n 150 --no-pager -o cat; }
+
+cf_tunnel_restart() {
+  systemctl restart cloudflared && ok "cloudflared 已重启。" || warn "cloudflared 重启失败, 请查看日志。"
+}
+
+cf_tunnel_stop() {
+  systemctl stop cloudflared && ok "cloudflared 已停止。" || warn "cloudflared 停止失败。"
+}
+
+cf_tunnel_uninstall() {
+  confirm "确认卸载 cloudflared 并移除其配置" N || return 0
+  local method
+  method=$(_cloudflared_install_method)
+
+  # 停止并移除 token 模式下由 'cloudflared service install' 生成的系统服务
+  # (与本脚本自建的 /etc/systemd/system/cloudflared.service 二选一存在, 两者都尝试清理)
+  systemctl disable --now cloudflared 2>/dev/null || true
+  command -v cloudflared >/dev/null 2>&1 && cloudflared service uninstall 2>/dev/null || true
+  rm -f /etc/systemd/system/cloudflared.service
+  systemctl daemon-reload 2>/dev/null || true
+
+  case "$method" in
+    apt)
+      apt-get remove -y -qq cloudflared 2>/dev/null || true
+      rm -f /etc/apt/sources.list.d/cloudflared.list /usr/share/keyrings/cloudflare-public-v2.gpg
+      ;;
+    binary)
+      rm -f /usr/local/bin/cloudflared
+      ;;
+  esac
+
+  rm -rf "$CF_CONFIG_DIR"
+  rm -f /root/.cloudflared/cert.pem "${HOME}/.cloudflared/cert.pem" 2>/dev/null || true
+  rm -rf /root/.cloudflared "${HOME}/.cloudflared" 2>/dev/null || true
+  rm -f "$CF_TUNNEL_STATE"
+  ok "cloudflared 已卸载 (安装方式: ${method}), 相关配置/凭证/systemd 单元已清理。"
+}
+
+cf_tunnel_rebind_token() {
+  read -r -s -p "新的 Cloudflare Tunnel Token (输入不回显): " tunnel_token
+  printf '\n'
+  [[ -n $tunnel_token ]] || die "Token 不能为空。"
+  systemctl stop cloudflared 2>/dev/null || true
+  cloudflared service uninstall 2>/dev/null || true
+  cloudflared service install "$tunnel_token"
+  systemctl enable --now cloudflared
+  ok "已重新绑定 Tunnel Token 并重启服务。"
+}
+
+cf_tunnel_menu() {
+  local choice
+  while true; do
+    title "Cloudflare Tunnel 管理"
+    printf '  1) 新建 Cloudflare Tunnel + VLESS WS 节点\n'
+    printf '  2) 查看状态\n'
+    printf '  3) 查看日志\n'
+    printf '  4) 重启\n'
+    printf '  5) 停止\n'
+    printf '  6) 重新绑定 Token\n'
+    printf '  7) 卸载\n'
+    printf '  8) 检查 / 升级 cloudflared 版本\n'
+    printf '  0) 返回主菜单\n'
+    IFS= read -r -e -p '请选择: ' choice
+    case $choice in
+      1) deploy_cloudflare_tunnel ;;
+      2) cf_tunnel_status ;;
+      3) cf_tunnel_logs ;;
+      4) cf_tunnel_restart ;;
+      5) cf_tunnel_stop ;;
+      6) cf_tunnel_rebind_token ;;
+      7) cf_tunnel_uninstall ;;
+      8) upgrade_cloudflared ;;
+      0) return 0 ;;
+      *) warn "无效的编号选择。" ;;
+    esac
+  done
+}
+# ===========================================================================
+# Cloudflare WARP 出站集成
+# 实现方式: 官方 cloudflare-warp 客户端 (warp-cli), 以 proxy 模式在本机
+# 127.0.0.1:40000 暴露 SOCKS5, 再作为 sing-box 的 socks 出站接入路由,
+# 避免直接接管整机路由表, 对宿主机其余服务零侵入。
+#
+# 重要限制 (如实说明, 不提供做不到的选项):
+#   warp-cli 官方客户端本身不提供"仅用 IPv4 出口"或"仅用 IPv6 出口"这种
+#   按协议族强制锁定的开关 (WARP 隧道内部是单一 WireGuard 会话, 出口地址
+#   由 Cloudflare 边缘分配, 客户端侧无法指定协议族)。因此这里不再提供
+#   "双栈 / IPv4 / IPv6" 这种实际上什么都不做的假选择, 只保留一个真实存在
+#   的可调项: 是否偏好用 IPv6 建立到 Cloudflare 边缘的隧道连接本身
+#   (tunnel protocol / 连接方式), 这与"出口协议族"是两回事, 已在菜单文案
+#   中明确区分。
+# ===========================================================================
+readonly WARP_SOCKS_PORT=40000
+readonly WARP_OUTBOUND_TAG="warp-out"
+
+install_warp_client() {
+  require_apt
+  info "配置 Cloudflare WARP 官方 APT 源"
+  install -d -m 755 /usr/share/keyrings
+  local warp_key_tmp
+  warp_key_tmp=$(mktemp)
+  run_with_progress "下载 Cloudflare WARP APT 密钥" curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg -o "$warp_key_tmp"
+  gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$warp_key_tmp"
+  rm -f "$warp_key_tmp"
+  local codename
+  codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+  tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null <<EOF
+deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
+EOF
+  run_with_progress "更新 WARP APT 索引" apt-get update -qq
+  run_with_progress "安装 Cloudflare WARP" apt-get install -y -qq cloudflare-warp
+}
+
+warp_ensure_registered() {
+  systemctl enable --now warp-svc >/dev/null 2>&1 || true
+  sleep 2
+  if ! warp-cli --accept-tos status >/dev/null 2>&1; then
+    warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+  fi
+}
+
+warp_connect() {
+  # WARP 本身只有"是否连接"的开关, 没有按协议族区分的模式,
+  # 这里固定用 proxy 模式在本机暴露 SOCKS5, 不再提供虚假的 v4/v6/dual 选择
+  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
+  warp-cli --accept-tos proxy port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || true
+  warp-cli --accept-tos connect >/dev/null 2>&1 || true
+}
+
+install_warp() {
+  ensure_installed
+  command -v warp-cli >/dev/null 2>&1 || install_warp_client
+  warp_ensure_registered
+  warp_connect
+  sleep 2
+
+  if ! warp-cli --accept-tos status 2>/dev/null | grep -qi "Connected"; then
+    warn "WARP 客户端未能确认 Connected 状态, 请稍后使用 'sb' 菜单中的 WARP 状态查看。"
+  fi
+
+  local candidate
+  candidate=$(mktemp)
+  jq --arg tag "$WARP_OUTBOUND_TAG" --argjson port "$WARP_SOCKS_PORT" '
+    if (.outbounds | map(select(.tag == $tag)) | length) == 0 then
+      .outbounds += [{type:"socks", tag:$tag, server:"127.0.0.1", server_port:$port, version:"5"}]
+    else . end
+  ' "$CONFIG_FILE" > "$candidate"
+  apply_candidate "$candidate"
+  rm -f "$candidate"
+
+  ok "WARP 已安装并以 SOCKS5 (127.0.0.1:${WARP_SOCKS_PORT}) 接入 sing-box 出站 [${WARP_OUTBOUND_TAG}]。"
+  info "可在部署节点或编辑路由规则时, 将出站指向 '${WARP_OUTBOUND_TAG}' 以让该节点流量经由 WARP。"
+  info "提示: WARP 官方客户端不支持按 IPv4/IPv6 协议族强制锁定出口, 因此本脚本不提供该选项。"
+}
+
+warp_status() {
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    warn "WARP 客户端尚未安装。"
+    return 0
+  fi
+  warp-cli --accept-tos status || true
+  printf '\nsing-box 内 WARP 出站配置:\n'
+  jq -r --arg tag "$WARP_OUTBOUND_TAG" '.outbounds[]? | select(.tag==$tag)' "$CONFIG_FILE" 2>/dev/null || true
+}
+
+uninstall_warp() {
+  confirm "确认卸载 WARP 客户端并移除其 sing-box 出站" N || return 0
+  systemctl disable --now warp-svc 2>/dev/null || true
+  apt-get remove -y -qq cloudflare-warp 2>/dev/null || true
+  atomic_json_update "$CONFIG_FILE" '.outbounds |= map(select(.tag != $tag))' --arg tag "$WARP_OUTBOUND_TAG" || true
+  systemctl restart sing-box 2>/dev/null || true
+  ok "WARP 已卸载。"
+}
+
+# ===========================================================================
+# cloudflared 自身版本管理 (与 sing-box 核心版本管理相互独立)
+# 判断当前 cloudflared 是通过 APT 源安装还是脚本自行下载的二进制安装,
+# 这两种方式的升级路径完全不同, 混用会导致状态不一致, 因此每次升级前
+# 都重新探测一次, 不做缓存。
+# ---------------------------------------------------------------------------
+readonly CLOUDFLARED_BIN_URL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
+
+_cloudflared_install_method() {
+  # 输出: apt | binary | none
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    printf 'none'
+    return 0
+  fi
+  if dpkg -S "$(command -v cloudflared)" >/dev/null 2>&1; then
+    printf 'apt'
+  else
+    printf 'binary'
+  fi
+}
+
+_cloudflared_current_version() {
+  command -v cloudflared >/dev/null 2>&1 || { printf ''; return 0; }
+  cloudflared --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+
+_cloudflared_latest_version() {
+  # 通过 GitHub Releases API 探测最新版本号, 探测失败不阻断流程 (可能网络
+  # 问题或被限流), 调用方需自行处理空字符串的情况
+  curl -fsS --connect-timeout 5 --max-time 8 \
+    "https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null \
+    | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//'
+}
+
+upgrade_cloudflared() {
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    warn "cloudflared 尚未安装, 请先在 Cloudflare Tunnel 菜单里新建一个 Tunnel 节点完成安装。"
+    return 0
+  fi
+
+  local method cur latest was_active
+  method=$(_cloudflared_install_method)
+  cur=$(_cloudflared_current_version)
+  latest=$(_cloudflared_latest_version)
+
+  printf '\n当前 cloudflared 版本: %s (安装方式: %s)\n' "${cur:-未知}" "$method"
+  if [[ -n $latest ]]; then
+    printf 'GitHub 最新版本: %s\n' "$latest"
+    if [[ -n $cur ]] && version_ge "$cur" "$latest"; then
+      ok "已是最新版本, 无需升级。"
+      return 0
+    fi
+  else
+    warn "无法从 GitHub 获取最新版本号 (可能是网络限制), 将继续按当前安装方式尝试升级。"
+  fi
+
+  was_active=0
+  systemctl is-active --quiet cloudflared 2>/dev/null && was_active=1
+
+  case "$method" in
+    apt)
+      info "通过 APT 升级 cloudflared..."
+      if ! run_with_progress "更新 cloudflared APT 索引" apt-get update -qq; then
+        warn "apt-get update 部分软件源同步失败 (详见 ${LOG_FILE}), 若是第三方源导致, 通常不影响 cloudflared 官方源本身, 继续尝试升级..."
+      fi
+      run_with_progress "升级 cloudflared" apt-get install -y -qq --only-upgrade cloudflared
+      ;;
+    binary)
+      info "通过二进制方式升级 cloudflared..."
+      local arch bin_url tmp_bin
+      arch=$(uname -m)
+      case "$arch" in
+        x86_64)  bin_url="${CLOUDFLARED_BIN_URL_BASE}/cloudflared-linux-amd64" ;;
+        aarch64) bin_url="${CLOUDFLARED_BIN_URL_BASE}/cloudflared-linux-arm64" ;;
+        armv7l)  bin_url="${CLOUDFLARED_BIN_URL_BASE}/cloudflared-linux-arm" ;;
+        *) die "未知的 CPU 架构 (${arch}), 无法确定二进制下载地址。" ;;
+      esac
+      tmp_bin=$(mktemp)
+      if ! run_with_progress "下载 cloudflared" curl -fsSL --retry 3 --connect-timeout 15 "$bin_url" -o "$tmp_bin"; then
+        rm -f "$tmp_bin"
+        die "下载最新 cloudflared 二进制失败, 请检查网络连接。"
+      fi
+      [[ -s $tmp_bin ]] || { rm -f "$tmp_bin"; die "下载的二进制文件为空, 已拒绝安装。"; }
+      install -m 755 "$tmp_bin" /usr/local/bin/cloudflared
+      rm -f "$tmp_bin"
+      ;;
+    *)
+      die "内部错误: 无法识别 cloudflared 安装方式。"
+      ;;
+  esac
+
+  if (( was_active == 1 )); then
+    systemctl restart cloudflared || warn "cloudflared 重启失败, 请运行 'sb cftunnel' 查看状态与日志。"
+  fi
+
+  ok "cloudflared 升级完成: $(cloudflared --version 2>/dev/null | head -n1)"
+}
+
+warp_menu() {
+  local choice
+  while true; do
+    title "Cloudflare WARP 管理"
+    printf '  1) 安装并连接 WARP\n'
+    printf '  2) 查看状态\n'
+    printf '  3) 卸载 WARP\n'
+    printf '  0) 返回主菜单\n'
+    IFS= read -r -e -p '请选择: ' choice
+    case $choice in
+      1) install_warp ;;
+      2) warp_status ;;
+      3) uninstall_warp ;;
+      0) return 0 ;;
+      *) warn "无效的编号选择。" ;;
+    esac
+  done
+}
+
+# ===========================================================================
+# 测速: 延迟 + 下载 + 上传 (Cloudflare / Google / Microsoft)
+# ===========================================================================
+_speedtest_one() {
+  local name=$1 dl_url=$2 ul_url=$3 latency_host=$4
+  local latency dl_bps dl_mbps ul_bps ul_mbps
+
+  printf '\n--- %s ---\n' "$name"
+  latency=$(curl -o /dev/null -s --connect-timeout 3 --max-time 5 \
+    -w '%{time_connect}' "https://${latency_host}/" 2>/dev/null || echo "N/A")
+  if [[ $latency != "N/A" ]]; then
+    printf '延迟: %s ms\n' "$(awk -v t="$latency" 'BEGIN{printf "%.1f", t*1000}')"
+  else
+    printf '延迟: 测量失败\n'
+  fi
+
+  # 下载测速: 100MB 在 10s 超时下要求 >=80Mbps 才能跑完整段, 低速线路会被
+  # --max-time 中途掐断 (curl 退出码非0), 此时不能简单地把结果记为 0——
+  # curl 在超时退出前仍会通过 -w 输出已完成部分的瞬时速率, 这里改为放宽
+  # 超时时间, 并且只要 -w 输出了合法数字就采用该值 (即便传输被中途终止),
+  # 只有连输出都没拿到时才归零, 避免慢速线路被误判为"下载速度为0"。
+  dl_bps=$(curl -o /dev/null -s --max-time 20 -w '%{speed_download}' "$dl_url" 2>/dev/null)
+  [[ $dl_bps =~ ^[0-9]+([.][0-9]+)?$ ]] || dl_bps=0
+  dl_mbps=$(awk -v b="$dl_bps" 'BEGIN{printf "%.2f", (b*8)/1000000}')
+  if (( $(awk -v b="$dl_bps" 'BEGIN{print (b==0)}') )); then
+    printf '下载速度: 测量失败或线路过慢 (20s 内未获得有效速率样本)\n'
+  else
+    printf '下载速度: %s Mbps\n' "$dl_mbps"
+  fi
+
+  if [[ -n $ul_url ]]; then
+    local tmpfile
+    tmpfile=$(mktemp)
+    dd if=/dev/urandom of="$tmpfile" bs=1M count=8 >/dev/null 2>&1
+    ul_bps=$(curl -o /dev/null -s --max-time 20 -w '%{speed_upload}' -X POST --data-binary "@${tmpfile}" "$ul_url" 2>/dev/null)
+    [[ $ul_bps =~ ^[0-9]+([.][0-9]+)?$ ]] || ul_bps=0
+    ul_mbps=$(awk -v b="$ul_bps" 'BEGIN{printf "%.2f", (b*8)/1000000}')
+    if (( $(awk -v b="$ul_bps" 'BEGIN{print (b==0)}') )); then
+      printf '上传速度: 测量失败或线路过慢 (20s 内未获得有效速率样本)\n'
+    else
+      printf '上传速度: %s Mbps\n' "$ul_mbps"
+    fi
+    rm -f "$tmpfile"
+  fi
+}
+
+_run_speedtest_impl() {
+  require_cmd curl awk
+  info "开始测速..."
+  echo "--- Cloudflare (延迟 + 下载 + 上传, 官方测速接口) ---"
+  _speedtest_one "Cloudflare" "https://speed.cloudflare.com/__down?bytes=104857600" \
+    "https://speed.cloudflare.com/__up" "speed.cloudflare.com"
+  echo
+  echo "--- Google (仅延迟, Google 无官方公开测速接口, 不编造下载地址) ---"
+  _latency_only "Google" "www.google.com"
+  echo
+  echo "--- Microsoft (仅延迟, Microsoft 无官方公开测速接口, 不编造下载地址) ---"
+  _latency_only "Microsoft" "www.microsoft.com"
+  printf '\n'
+  ok "测速完成。"
+}
+
+run_speedtest() { run_with_progress "服务器测速" --show-output _run_speedtest_impl; }
+
+_latency_only() {
+  local name=$1 host=$2 latency
+  latency=$(curl -o /dev/null -s --connect-timeout 3 --max-time 5 \
+    -w '%{time_connect}' "https://${host}/" 2>/dev/null || echo "N/A")
+  if [[ $latency != "N/A" ]]; then
+    printf '%s 延迟: %s ms\n' "$name" "$(awk -v t="$latency" 'BEGIN{printf "%.1f", t*1000}')"
+  else
+    printf '%s 延迟: 测量失败 (可能被防火墙/网络策略阻断)\n' "$name"
+  fi
+}
+
+# ===========================================================================
+# 系统诊断
+# ===========================================================================
+diag_check_ports() {
+  printf '\n[端口占用]\n'
+  if [[ -f $CONFIG_FILE ]]; then
+    jq -r '.inbounds[]? | select(.listen_port != null) | "\(.listen_port)"' "$CONFIG_FILE" | sort -u | while read -r p; do
+      if command -v ss >/dev/null 2>&1 && ss -tulnH "sport = :$p" 2>/dev/null | grep -q .; then
+        printf "  端口 %s: ${GREEN}监听中${NC}\n" "$p"
+      else
+        printf "  端口 %s: ${RED}未监听 (异常)${NC}\n" "$p"
+      fi
+    done
+  fi
+}
+
+diag_check_dns() {
+  printf '\n[DNS 解析]\n'
+  if command -v dig >/dev/null 2>&1; then
+    dig +short example.com A 2>/dev/null | head -3 || printf '  DNS 解析失败\n'
+  else
+    getent hosts example.com || printf '  DNS 解析失败\n'
+  fi
+}
+
+diag_check_network() {
+  printf '\n[网络栈]\n'
+  printf '  IPv4 出网: %s\n' "$(check_ipv4_egress && echo 可用 || echo 不可用)"
+  printf '  IPv6 出网: %s\n' "$(check_ipv6_egress && echo 可用 || echo 不可用)"
+}
+
+diag_check_bbr() {
+  printf '\n[BBR / 拥塞控制]\n'
+  printf '  当前算法: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)"
+  printf '  队列规则: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)"
+}
+
+diag_check_firewall() {
+  printf '\n[防火墙]\n'
+  if command -v ufw >/dev/null 2>&1; then
+    printf '  UFW: %s\n' "$(ufw status 2>/dev/null | head -1)"
+  else
+    printf '  UFW: 未安装\n'
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    printf '  firewalld: %s\n' "$(systemctl is-active firewalld 2>/dev/null || echo 未运行)"
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+      printf '  nftables: 已启用本脚本管理的表 [%s]\n' "$NFT_TABLE"
+    else
+      printf '  nftables: 已安装, 本脚本尚未在其上创建规则\n'
+    fi
+  fi
+}
+
+diag_check_cloudflared() {
+  printf '\n[Cloudflare Tunnel]\n'
+  if command -v cloudflared >/dev/null 2>&1; then
+    printf '  已安装: %s (方式: %s)\n' "$(cloudflared --version 2>/dev/null | head -1)" "$(_cloudflared_install_method)"
+    printf '  服务状态: %s\n' "$(systemctl is-active cloudflared 2>/dev/null || echo 未运行)"
+  else
+    diag_skip 'Cloudflare Tunnel 未安装'
+  fi
+}
+
+diag_check_singbox() {
+  printf '\n[sing-box 配置与服务]\n'
+  if command -v sing-box >/dev/null 2>&1; then
+    printf '  版本: %s\n' "$(sing-box version | head -1)"
+    if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+      printf '  配置语法: 通过\n'
+    else
+      printf "  配置语法: ${RED}失败${NC}\n"
+    fi
+    printf '  服务状态: %s\n' "$(systemctl is-active sing-box 2>/dev/null || echo 未运行)"
+  else
+    printf '  sing-box 未安装\n'
+  fi
+}
+
+diag_check_resources() {
+  printf '\n[系统资源]\n'
+  local pct ipct
+  df -h / | awk 'NR==2{printf "  磁盘 /: 已用 %s / %s (%s)\n",$3,$2,$5}'
+  pct=$(df --output=pcent / | tail -n1 | tr -dc '0-9')
+  ipct=$(df --output=ipcent / | tail -n1 | tr -dc '0-9')
+  (( ${pct:-0} < 90 ))  || printf "  ${RED}磁盘使用率 >= 90%%, 请清理${NC}\n"
+  (( ${ipct:-0} < 90 )) || printf "  ${RED}inode 使用率 >= 90%%${NC}\n"
+  free -m | awk '/^Mem:/{printf "  内存: 已用 %s MB / 共 %s MB, 可用 %s MB\n",$3,$2,$7}
+                 /^Swap:/{printf "  Swap: 已用 %s MB / 共 %s MB\n",$3,$2}'
+  printf '  负载: %s (CPU 核数 %s)\n' "$(cut -d' ' -f1-3 /proc/loadavg)" "$(nproc)"
+  printf '  sing-box 内存: %s\n' "$(systemctl show sing-box -p MemoryCurrent --value 2>/dev/null | awk '{ if ($1 ~ /^[0-9]+$/) printf "%.1f MB", $1/1048576; else print "未知" }')"
+  printf '  时间同步: %s\n' "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo 未知)"
+}
+
+run_diagnostics() {
+  ensure_installed
+  DIAG_ACTIVE=1; DIAG_PASS=0; DIAG_WARN=0; DIAG_FAIL=0; DIAG_SKIP=0
+  title "系统诊断"
+  diag_run_check '系统资源' diag_check_resources
+  diag_run_check '端口监听' diag_check_ports
+  diag_run_check 'DNS 解析' diag_check_dns
+  diag_run_check '网络栈' diag_check_network
+  diag_run_check 'BBR 拥塞控制' diag_check_bbr
+  diag_run_check '防火墙' diag_check_firewall
+  diag_run_check 'Cloudflare Tunnel' diag_check_cloudflared
+  diag_run_check 'sing-box 配置与服务' diag_check_singbox
+  printf '\n'
+  DIAG_ACTIVE=0
+  printf '结果：%d 通过  %d 警告  %d 异常  %d 跳过\n' "$DIAG_PASS" "$DIAG_WARN" "$DIAG_FAIL" "$DIAG_SKIP"
+  if (( DIAG_WARN || DIAG_FAIL )); then printf '建议：处理上述异常后运行 sb reconcile 检查节点记录与配置一致性。\n'; fi
+  ok "诊断完成。"
+}
+
+diag_run_check() {
+  local label=$1 fn=$2 output rc=0 state='✓'
+  output=$($fn 2>&1) || rc=$?
+  if grep -q '跳过' <<< "$output"; then state='–'; ((DIAG_SKIP+=1)) || true
+  elif (( rc != 0 )) || grep -Eq '失败|异常|不可用|未监听' <<< "$output"; then state='✗'; ((DIAG_FAIL+=1)) || true
+  elif grep -Eq '未安装|未运行|未知|警告' <<< "$output"; then state='!'; ((DIAG_WARN+=1)) || true
+  else ((DIAG_PASS+=1)) || true; fi
+  printf '%s %s\n' "$state" "$label"
+  if [[ -n $output ]]; then sed 's/^/  /' <<< "$output"; fi
+}
+# ===========================================================================
+# 订阅系统
+# 生成三类订阅文件到 SUB_DIR:
+#   sub-singbox.json   sing-box 客户端可直接导入的 outbounds 片段
+#   sub-clash.yaml      Clash Meta / Mihomo 通用 YAML
+#   sub-universal.txt   Base64 编码的 vless/ss/trojan/hy2/tuic URI 列表
+#                         (Shadowrocket / v2rayN / NekoBox 等通用订阅格式)
+# 可选启动一个仅监听 127.0.0.1 的 python3 http.server 供 nginx/反代转发,
+# 或直接用本机文件路径自行分发, 不强制暴露公网端口。
+# ===========================================================================
+readonly SUB_PORT_DEFAULT=28080
+readonly SUB_TOKEN_FILE="${STATE_DIR}/sub_token"
+readonly SUB_AUTH_SERVER="${STATE_DIR}/sub-server.py"
+
+sub_collect_uris() {
+  jq -r '.connections[]?.uri' "$STATE_FILE" 2>/dev/null
+}
+
+# 给 sing-box JSON / Clash 用: 排除这两种格式在当前实现里表达不了的 ShadowTLS 节点
+sub_collect_uris_plain() {
+  sub_collect_uris | grep -v 'plugin=shadow-tls' || true
+}
+
+sub_build_universal() {
+  ensure_dirs
+  local out="${SUB_DIR}/sub-universal.txt" tmp
+  tmp=$(mktemp)
+  sub_collect_uris > "$tmp"
+  if [[ ! -s $tmp ]]; then
+    rm -f "$tmp"
+    warn "尚无任何节点记录, 无法生成订阅。"
+    return 1
+  fi
+  base64 -w 0 "$tmp" > "${out}.tmp"
+  mv -f "${out}.tmp" "$out"
+  chmod 600 "$out"
+  rm -f "$tmp"
+  printf '%s' "$out"
+}
+
+sub_build_singbox_json() {
+  ensure_dirs
+  local out="${SUB_DIR}/sub-singbox.json" tmp
+  tmp=$(mktemp)
+  # 直接复用生产 config.json 的 outbounds 中非 direct/block/warp 的节点定义是不现实的
+  # (inbound 与 outbound 结构不同), 这里改为逐条把已保存 URI 转成 sing-box outbound JSON。
+  jq -n '{outbounds: []}' > "$tmp"
+  while IFS= read -r uri; do
+    [[ -z $uri ]] && continue
+    local ob
+    ob=$(uri_to_singbox_outbound "$uri" || true)
+    [[ -n $ob ]] || continue
+  jq --argjson ob "$ob" '.outbounds += [$ob]' "$tmp" > "${tmp}.n" && mv "${tmp}.n" "$tmp"
+  done < <(sub_collect_uris_plain)
+  json_validate "$tmp" || { rm -f "$tmp"; die "生成 sing-box 订阅 JSON 失败。"; }
+  atomic_install "$tmp" "$out" 600
+  rm -f "$tmp"
+  printf '%s' "$out"
+}
+
+# 极简 URI -> sing-box outbound 解析器, 覆盖本脚本自身生成的 vless/ss/trojan/hy2/tuic URI
+uri_to_singbox_outbound() {
+  local uri=$1 scheme rest tag
+  scheme=${uri%%://*}
+  rest=${uri#*://}
+  tag=$(printf '%s' "$uri" | sed -n 's/.*#\(.*\)$/\1/p')
+  tag=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "${tag:-node}" 2>/dev/null || printf '%s' "${tag:-node}")
+  case "$scheme" in
+    snell)
+      local hostport query host port psk version
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}; host=${hostport%:*}; port=${hostport##*:}
+      psk=$(printf '%s' "$query" | grep -oE 'psk=[^&]*' | cut -d= -f2); version=$(printf '%s' "$query" | grep -oE 'version=[^&]*' | cut -d= -f2); [[ $version == 5 ]] && version=4
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-8388}" --arg psk "$psk" --argjson version "${version:-6}" '{type:"snell",tag:$tag,server:$host,server_port:$port,version:$version,psk:$psk} + (if $version == 6 then {mode:"default"} else {obfs_mode:"none"} end)' 2>/dev/null
+      ;;
+    "naive+https")
+      local userinfo hostport username password host port
+      userinfo=${rest%%@*}; rest=${rest#*@}; hostport=${rest%%\?*}; host=${hostport%:*}; port=${hostport##*:}; username=${userinfo%%:*}; password=${userinfo#*:}
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-443}" --arg username "$username" --arg password "$password" '{type:"naive",tag:$tag,server:$host,server_port:$port,username:$username,password:$password,network:"tcp",tls:{enabled:true,server_name:$host}}' 2>/dev/null
+      ;;
+    vless)
+      local userinfo hostport query uuid host port sni pbk sid flow security stype svc path
+      userinfo=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      uuid=$userinfo
+      host=${hostport%:*}; port=${hostport##*:}
+      security=$(printf '%s' "$query" | grep -oE 'security=[^&]*' | cut -d= -f2)
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      pbk=$(printf '%s' "$query" | grep -oE 'pbk=[^&]*' | cut -d= -f2)
+      sid=$(printf '%s' "$query" | grep -oE 'sid=[^&]*' | cut -d= -f2)
+      flow=$(printf '%s' "$query" | grep -oE 'flow=[^&]*' | cut -d= -f2)
+      stype=$(printf '%s' "$query" | grep -oE 'type=[^&]*' | cut -d= -f2)
+      svc=$(printf '%s' "$query" | grep -oE 'serviceName=[^&]*' | cut -d= -f2)
+      path=$(printf '%s' "$query" | grep -oE 'path=[^&]*' | cut -d= -f2)
+      path=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "${path:-/}" 2>/dev/null || printf '%s' "${path:-/}")
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-443}" --arg uuid "$uuid" \
+        --arg security "$security" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" \
+        --arg stype "$stype" --arg svc "$svc" --arg path "$path" '
+        {type:"vless", tag:$tag, server:$host, server_port:$port, uuid:$uuid} +
+        (if $flow != "" then {flow:$flow} else {} end) +
+        (if $security == "reality" then
+          {tls:{enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:"chrome"},
+                reality:{enabled:true, public_key:$pbk, short_id:$sid}}}
+         elif $security == "tls" then
+          {tls:{enabled:true, server_name:$sni}}
+         else {} end) +
+        (if $stype == "grpc" then {transport:{type:"grpc", service_name:$svc}}
+         elif $stype == "ws" then {transport:{type:"ws", path:$path}}
+         else {} end)
+      ' 2>/dev/null
+      ;;
+    trojan)
+      local password hostport query host port sni
+      password=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-443}" --arg password "$password" --arg sni "$sni" \
+        '{type:"trojan", tag:$tag, server:$host, server_port:$port, password:$password, tls:{enabled:true, server_name:$sni}}' 2>/dev/null
+      ;;
+    ss)
+      local b64 hostport host port method pass decoded
+      b64=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; hostport=${hostport%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      valid_port "$port" || return 1
+      decoded=$(printf '%s' "$b64" | base64 -d 2>/dev/null || true)
+      method=${decoded%%:*}; pass=${decoded#*:}
+      [[ -n $method && -n $pass ]] || return 1
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg method "$method" --arg pass "$pass" \
+        '{type:"shadowsocks", tag:$tag, server:$host, server_port:$port, method:$method, password:$pass}' 2>/dev/null
+      ;;
+    hysteria2)
+      local password hostport query host port sni obfs
+      password=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      obfs=$(printf '%s' "$query" | grep -oE 'obfs-password=[^&]*' | cut -d= -f2)
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-443}" --arg password "$password" --arg sni "$sni" --arg obfs "$obfs" \
+        '{type:"hysteria2", tag:$tag, server:$host, server_port:$port, password:$password,
+          obfs:{type:"salamander", password:$obfs}, tls:{enabled:true, server_name:$sni}}' 2>/dev/null
+      ;;
+    tuic)
+      local cred hostport query host port sni uuid password
+      cred=${rest%%@*}; rest=${rest#*@}
+      uuid=${cred%%:*}; password=${cred#*:}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-443}" --arg uuid "$uuid" --arg password "$password" --arg sni "$sni" \
+        '{type:"tuic", tag:$tag, server:$host, server_port:$port, uuid:$uuid, password:$password,
+          congestion_control:"bbr", tls:{enabled:true, server_name:$sni}}' 2>/dev/null
+      ;;
+    snell)
+      local hostport query host port psk version
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}; host=${hostport%:*}; port=${hostport##*:}
+      psk=$(printf '%s' "$query" | grep -oE 'psk=[^&]*' | cut -d= -f2); version=$(printf '%s' "$query" | grep -oE 'version=[^&]*' | cut -d= -f2); [[ $version == 5 ]] && version=4
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-8388}" --arg psk "$psk" --argjson version "${version:-6}" '{type:"snell",tag:$tag,server:$host,server_port:$port,version:$version,psk:$psk} + (if $version == 6 then {mode:"default"} else {obfs_mode:"none"} end)' 2>/dev/null
+      ;;
+    "naive+https")
+      local userinfo hostport username password host port
+      userinfo=${rest%%@*}; rest=${rest#*@}; hostport=${rest%%\?*}; host=${hostport%:*}; port=${hostport##*:}; username=${userinfo%%:*}; password=${userinfo#*:}
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-443}" --arg username "$username" --arg password "$password" '{type:"naive",tag:$tag,server:$host,server_port:$port,username:$username,password:$password,network:"tcp",tls:{enabled:true,server_name:$host}}' 2>/dev/null
+      ;;
+    anytls)
+      local password hostport query host port sni
+      password=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      jq -n --arg tag "$tag" --arg host "$host" --argjson port "${port:-443}" --arg password "$password" --arg sni "$sni" \
+        '{type:"anytls", tag:$tag, server:$host, server_port:$port, password:$password, tls:{enabled:true, server_name:$sni}}' 2>/dev/null
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+sub_build_clash_yaml() {
+  ensure_dirs
+  local out="${SUB_DIR}/sub-clash.yaml" tmp
+  if [[ -z $(sub_collect_uris_plain) ]]; then
+    warn "没有 Clash 可表达的节点 (ShadowTLS 节点已跳过), 未生成 Clash 订阅。"
+    return 1
+  fi
+  tmp=$(mktemp)
+  {
+    printf 'proxies:\n'
+    while IFS= read -r uri; do
+      [[ -z $uri ]] && continue
+            clash_proxy_yaml_from_uri "$uri" || true
+    done < <(sub_collect_uris_plain)
+    printf 'proxy-groups:\n'
+    printf '  - name: PROXY\n'
+    printf '    type: select\n'
+    printf '    proxies:\n'
+    while IFS= read -r uri; do
+      [[ -z $uri ]] && continue
+      local name
+      name=$(printf '%s' "$uri" | sed -n 's/.*#\(.*\)$/\1/p')
+      name=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "${name:-node}" 2>/dev/null || printf '%s' "${name:-node}")
+    printf '      - "%s"\n' "$name"
+    done < <(sub_collect_uris_plain)
+    printf 'rules:\n  - MATCH,PROXY\n'
+  } > "$tmp"
+  atomic_install "$tmp" "$out" 600
+  rm -f "$tmp"
+  printf '%s' "$out"
+}
+
+clash_proxy_yaml_from_uri() {
+  local uri=$1 scheme rest name
+  scheme=${uri%%://*}; rest=${uri#*://}
+  name=$(printf '%s' "$uri" | sed -n 's/.*#\(.*\)$/\1/p')
+  name=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "${name:-node}" 2>/dev/null || printf '%s' "${name:-node}")
+  case "$scheme" in
+    snell)
+      local hostport query host port psk version
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}; host=${hostport%:*}; port=${hostport##*:}
+      psk=$(printf '%s' "$query" | grep -oE 'psk=[^&]*' | cut -d= -f2); version=$(printf '%s' "$query" | grep -oE 'version=[^&]*' | cut -d= -f2)
+      printf '  - name: "%s"\n    type: snell\n    server: %s\n    port: %s\n    psk: "%s"\n    version: %s\n' "$name" "$host" "$port" "$psk" "${version:-6}"
+      ;;
+    "naive+https")
+      local userinfo hostport host port username password
+      userinfo=${rest%%@*}; rest=${rest#*@}; hostport=${rest%%\?*}; hostport=${hostport%%#*}; host=${hostport%:*}; port=${hostport##*:}; username=${userinfo%%:*}; password=${userinfo#*:}
+      printf '  - name: "%s"\n    type: naive\n    server: %s\n    port: %s\n    username: "%s"\n    password: "%s"\n' "$name" "$host" "$port" "$username" "$password"
+      ;;
+    vless)
+      local userinfo hostport query uuid host port sni pbk sid flow security stype svc path host_hdr
+      userinfo=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      uuid=$userinfo; host=${hostport%:*}; port=${hostport##*:}
+      security=$(printf '%s' "$query" | grep -oE 'security=[^&]*' | cut -d= -f2)
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      pbk=$(printf '%s' "$query" | grep -oE 'pbk=[^&]*' | cut -d= -f2)
+      sid=$(printf '%s' "$query" | grep -oE 'sid=[^&]*' | cut -d= -f2)
+      flow=$(printf '%s' "$query" | grep -oE 'flow=[^&]*' | cut -d= -f2)
+      stype=$(printf '%s' "$query" | grep -oE 'type=[^&]*' | cut -d= -f2)
+      svc=$(printf '%s' "$query" | grep -oE 'serviceName=[^&]*' | cut -d= -f2)
+      path=$(printf '%s' "$query" | grep -oE 'path=[^&]*' | cut -d= -f2)
+      path=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "${path:-/}" 2>/dev/null || printf '%s' "${path:-/}")
+      host_hdr=$(printf '%s' "$query" | grep -oE 'host=[^&]*' | cut -d= -f2)
+      printf '  - name: "%s"\n    type: vless\n    server: %s\n    port: %s\n    uuid: %s\n    network: %s\n' \
+        "$name" "$host" "$port" "$uuid" "${stype:-tcp}"
+      [[ -n $flow ]] && printf '    flow: %s\n' "$flow"
+      if [[ $security == reality ]]; then
+        printf '    tls: true\n    servername: %s\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: %s\n      short-id: "%s"\n' \
+          "$sni" "$pbk" "$sid"
+      elif [[ $security == tls ]]; then
+        printf '    tls: true\n    servername: %s\n' "$sni"
+      fi
+      [[ $stype == grpc ]] && printf '    grpc-opts:\n      grpc-service-name: %s\n' "$svc"
+      [[ $stype == ws ]] && printf '    ws-opts:\n      path: "%s"\n      headers:\n        Host: %s\n' "$path" "${host_hdr:-$sni}"
+      ;;
+    trojan)
+      local password hostport query host port sni
+      password=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      printf '  - name: "%s"\n    type: trojan\n    server: %s\n    port: %s\n    password: %s\n    sni: %s\n' \
+        "$name" "$host" "$port" "$password" "$sni"
+      ;;
+    ss)
+      local b64 hostport host port decoded method pass
+      b64=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; hostport=${hostport%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      decoded=$(printf '%s' "$b64" | base64 -d 2>/dev/null || true)
+      method=${decoded%%:*}; pass=${decoded#*:}
+      printf '  - name: "%s"\n    type: ss\n    server: %s\n    port: %s\n    cipher: %s\n    password: "%s"\n' \
+        "$name" "$host" "$port" "$method" "$pass"
+      ;;
+    hysteria2)
+      local password hostport query host port sni obfs
+      password=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      obfs=$(printf '%s' "$query" | grep -oE 'obfs-password=[^&]*' | cut -d= -f2)
+      printf '  - name: "%s"\n    type: hysteria2\n    server: %s\n    port: %s\n    password: "%s"\n    sni: %s\n    obfs: salamander\n    obfs-password: "%s"\n' \
+        "$name" "$host" "$port" "$password" "$sni" "$obfs"
+      ;;
+    tuic)
+      local cred hostport query host port sni uuid password
+      cred=${rest%%@*}; rest=${rest#*@}
+      uuid=${cred%%:*}; password=${cred#*:}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      printf '  - name: "%s"\n    type: tuic\n    server: %s\n    port: %s\n    uuid: %s\n    password: "%s"\n    sni: %s\n    congestion-controller: bbr\n' \
+        "$name" "$host" "$port" "$uuid" "$password" "$sni"
+      ;;
+          snell)
+            local hostport query host port psk version
+            hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}; host=${hostport%:*}; port=${hostport##*:}
+            psk=$(printf '%s' "$query" | grep -oE 'psk=[^&]*' | cut -d= -f2); version=$(printf '%s' "$query" | grep -oE 'version=[^&]*' | cut -d= -f2)
+            printf '  - name: "%s"\n    type: snell\n    server: %s\n    port: %s\n    psk: "%s"\n    version: %s\n' "$name" "$host" "$port" "$psk" "${version:-6}"
+            ;;
+          "naive+https")
+            local userinfo hostport host port username password
+            userinfo=${rest%%@*}; rest=${rest#*@}; hostport=${rest%%\?*}; hostport=${hostport%%#*}; host=${hostport%:*}; port=${hostport##*:}; username=${userinfo%%:*}; password=${userinfo#*:}
+            printf '  - name: "%s"\n    type: naive\n    server: %s\n    port: %s\n    username: "%s"\n    password: "%s"\n' "$name" "$host" "$port" "$username" "$password"
+            ;;
+          anytls)
+      local password hostport query host port sni
+      password=${rest%%@*}; rest=${rest#*@}
+      hostport=${rest%%\?*}; query=${rest#*\?}; query=${query%%#*}
+      host=${hostport%:*}; port=${hostport##*:}
+      sni=$(printf '%s' "$query" | grep -oE 'sni=[^&]*' | cut -d= -f2)
+      printf '  - name: "%s"\n    type: anytls\n    server: %s\n    port: %s\n    password: "%s"\n    sni: %s\n    client-fingerprint: chrome\n' \
+        "$name" "$host" "$port" "$password" "$sni"
+      ;;
+  esac
+}
+
+sub_build_all() {
+  ensure_dirs
+  local f1 f2 f3
+  f1=$(sub_build_universal) || return 1
+  f2=$(sub_build_singbox_json)
+  f3=$(sub_build_clash_yaml)
+  ok "订阅文件已生成:"
+  printf '  通用 (Shadowrocket/v2rayN/NekoBox): %s\n' "$f1"
+  printf '  sing-box JSON: %s\n' "$f2"
+  printf '  Clash Meta / Mihomo YAML: %s\n' "$f3"
+}
+
+sub_serve_start() {
+  ensure_dirs
+  local port token
+  port=$(ask_port "本地订阅 HTTP 服务端口 (仅监听 127.0.0.1, 自行用 Nginx/Caddy 反代加 TLS)" "$SUB_PORT_DEFAULT")
+  write_sub_auth_server
+  token=$(ensure_sub_token)
+  tee "$SUB_HTTPD_UNIT" >/dev/null <<EOF
+[Unit]
+Description=sing-box-vps subscription file server (127.0.0.1 only, token auth)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${SUB_DIR}
+ExecStart=/usr/bin/python3 ${SUB_AUTH_SERVER} ${port} ${SUB_DIR} ${SUB_TOKEN_FILE}
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now sing-box-vps-sub
+  ok "订阅服务已启动 (已启用 token 校验)"
+  printf '自适应订阅链接 (推荐, 根据客户端自动识别格式): http://127.0.0.1:%s/sub?token=%s\n' "$port" "$token"
+  printf '对外域名示例: https://你的域名/sub?token=%s\n' "$token"
+  printf '如需强制指定格式, 把 /sub 换成: /sub-clash.yaml (Clash/Mihomo) | /sub-singbox.json (sing-box) | /sub-universal.txt (v2rayN/Shadowrocket/NekoBox 等)\n'
+}
+
+ensure_sub_token() {
+  ensure_dirs
+  if [[ ! -f $SUB_TOKEN_FILE ]]; then
+    openssl rand -hex 16 > "$SUB_TOKEN_FILE"
+    chmod 600 "$SUB_TOKEN_FILE"
+  fi
+  cat "$SUB_TOKEN_FILE"
+}
+
+regenerate_sub_token() {
+  ensure_dirs
+  openssl rand -hex 16 > "$SUB_TOKEN_FILE"
+  chmod 600 "$SUB_TOKEN_FILE"
+  systemctl restart sing-box-vps-sub 2>/dev/null || true
+  ok "订阅访问 token 已重置为: $(cat "$SUB_TOKEN_FILE")"
+  warn "旧链接已失效, 请用新 token 更新客户端订阅地址。"
+}
+
+write_sub_auth_server() {
+  tee "$SUB_AUTH_SERVER" >/dev/null <<'PYEOF'
+#!/usr/bin/env python3
+import http.server, socketserver, sys, re, os
+from urllib.parse import urlparse, parse_qs
+
+PORT = int(sys.argv[1])
+DIRECTORY = sys.argv[2]
+TOKEN_FILE = sys.argv[3]
+
+with open(TOKEN_FILE) as f:
+    TOKEN = f.read().strip()
+
+CLASH_UA_RE = re.compile(r'(clash|mihomo|stash|verge|flclash)', re.I)
+SINGBOX_UA_RE = re.compile(r'(sing-?box|sfa|sfi|sfm)', re.I)
+AUTO_PATHS = ("/", "/sub", "/subscribe")
+
+class AuthHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=DIRECTORY, **kwargs)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        token = qs.get("token", [""])[0]
+        if token != TOKEN:
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"Forbidden")
+            return
+
+        if parsed.path in AUTO_PATHS:
+            ua = self.headers.get("User-Agent", "")
+            if CLASH_UA_RE.search(ua):
+                fname, ctype = "sub-clash.yaml", "text/yaml; charset=utf-8"
+            elif SINGBOX_UA_RE.search(ua):
+                fname, ctype = "sub-singbox.json", "application/json; charset=utf-8"
+            else:
+                fname, ctype = "sub-universal.txt", "text/plain; charset=utf-8"
+            self._serve_file(fname, ctype)
+            return
+
+        self.path = parsed.path
+        super().do_GET()
+
+    def _serve_file(self, fname, ctype):
+        fpath = os.path.join(DIRECTORY, fname)
+        try:
+            with open(fpath, "rb") as f:
+                body = f.read()
+        except OSError:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not generated yet, run: sb sub -> 1")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def list_directory(self, path):
+        self.send_error(403, "Directory listing disabled")
+        return None
+
+    def log_message(self, fmt, *args):
+        pass
+
+with socketserver.TCPServer(("127.0.0.1", PORT), AuthHandler) as httpd:
+    httpd.serve_forever()
+PYEOF
+  chmod 755 "$SUB_AUTH_SERVER"
+}
+
+sub_serve_stop() {
+  systemctl disable --now sing-box-vps-sub 2>/dev/null || true
+  ok "订阅本地服务已停止。"
+}
+
+subscription_menu() {
+  local choice
+  while true; do
+    title "订阅系统"
+    printf '  1) 生成 / 刷新全部订阅文件\n'
+    printf '  2) 查看订阅文件路径\n'
+    printf '  3) 启动本地订阅 HTTP 服务 (127.0.0.1)\n'
+    printf '  4) 停止本地订阅 HTTP 服务\n'
+    printf '  5) 删除全部订阅文件\n'
+    printf '  6) 查看 / 重置订阅访问 token\n'
+    printf '  0) 返回主菜单\n'
+    IFS= read -r -e -p '请选择: ' choice
+    case $choice in
+      1) sub_build_all ;;
+      2) find "$SUB_DIR" -maxdepth 1 -type f 2>/dev/null | sed 's/^/  - /' ;;
+      3) sub_serve_start ;;
+      4) sub_serve_stop ;;
+      5) confirm "确认删除全部订阅文件" N && rm -f "${SUB_DIR:?}"/* && ok "已清空订阅文件。" ;;
+      6)
+        if [[ -f $SUB_TOKEN_FILE ]]; then
+          printf '当前 token: %s\n' "$(cat "$SUB_TOKEN_FILE")"
+          confirm "是否重置 token (旧链接将立即失效)" N && regenerate_sub_token
+        else
+          ensure_sub_token >/dev/null
+          ok "已生成新 token: $(cat "$SUB_TOKEN_FILE")"
+        fi
+        ;;
+      0) return 0 ;;
+      *) warn "无效的编号选择。" ;;
+    esac
+  done
+}
+# ===========================================================================
+# 节点管理 / 运维
+# ===========================================================================
+show_connections() {
+  ensure_dirs
+  if [[ $(jq '.connections | length' "$STATE_FILE") -eq 0 ]]; then
+    warn "尚未由本脚本创建任何连接记录。"
+    return 0
+  fi
+  printf '\n已保存的客户端连接串:\n\n'
+  jq -r '.connections[] | "[\(.type)] \(.tag) -> \(.host):\(.port)\n\(.uri)\n"' "$STATE_FILE"
+}
+
+show_connection_qrcode() {
+  ensure_dirs
+  local tags tag uri
+  if [[ $(jq '.connections | length' "$STATE_FILE") -eq 0 ]]; then
+    warn "尚未由本脚本创建任何连接记录。"
+    return 0
+  fi
+  mapfile -t tags < <(jq -r '.connections[].tag' "$STATE_FILE")
+  printf '\n可用节点:\n'
+  local i
+  for i in "${!tags[@]}"; do printf '  %d) %s\n' "$((i+1))" "${tags[$i]}"; done
+  IFS= read -r -e -p "选择要显示二维码的节点编号: " idx
+  [[ $idx =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#tags[@]} )) || die "无效编号。"
+  tag=${tags[$((idx-1))]}
+  uri=$(jq -r --arg tag "$tag" '.connections[] | select(.tag==$tag) | .uri' "$STATE_FILE")
+  print_result_block "$tag" "$uri" "$tag"
+}
+
+list_inbounds() {
+  ensure_base_routing
+  jq -r '.inbounds | to_entries[] | "\(.key + 1). \(.value.tag) [\(.value.type)] :\(.value.listen_port // "Detour")"' "$CONFIG_FILE"
+}
+
+remove_inbound() {
+  ensure_installed
+  if [[ $(jq '.inbounds | length' "$CONFIG_FILE") -eq 0 ]]; then
+    warn "当前没有任何入站节点。"
+    return 0
+  fi
+  printf '\n当前已配置的入站:\n'
+  list_inbounds
+  local tag
+  if [[ -n $SELECTED_NODE_TAG ]]; then tag=$SELECTED_NODE_TAG; SELECTED_NODE_TAG=""; else tag=$(ask_required "请输入要删除的节点 tag"); fi
+  valid_safe_token "$tag" || die "非法 tag 格式。"
+  jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1 || die "未找到对应的节点 tag。"
+  confirm "确认删除 ${tag} 并清除关联的分流规则" N || return 0
+
+  local listen_port
+  listen_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port // empty' "$CONFIG_FILE")
+
+  local candidate
+  candidate=$(mktemp)
+  jq --arg tag "$tag" '
+    ([.inbounds[]? | select(.tag == $tag) | .detour // empty]) as $detours |
+    .inbounds |= map(select(.tag != $tag and ((.tag | IN($detours[])) | not))) |
+    if .route.rules then .route.rules |= map(select((.inbound // []) | index($tag) | not)) else . end
+  ' "$CONFIG_FILE" > "$candidate"
+  apply_candidate "$candidate"
+  rm -f "$candidate"
+
+  if [[ -n $listen_port ]]; then
+    close_firewall_port "$listen_port" tcp
+    close_firewall_port "$listen_port" udp
+  fi
+
+  atomic_json_update "$STATE_FILE" '.connections |= map(select(.tag != $tag))' --arg tag "$tag" || true
+  ok "已成功删除 ${tag} 并同步更新路由。"
+}
+
+# 按 inbound.type (config.json 里的字段) 返回需要放行的传输层协议,
+# 与 _type_protocols (按 connections.json 的 type 字段) 是同一套映射,
+# 但 reconcile 阶段可能连 connections.json 记录都还没有, 所以单独按
+# config 里的 .type 做一次判断
+_inbound_protocols() {
+  _proto_fw_protocols "$1"
+}
+_proto_fw_protocols() {
+  case "$1" in
+    hysteria2*|tuic*) printf 'udp\n' ;;
+    shadowsocks*|naive*) printf 'tcp\nudp\n' ;;
+    *) printf 'tcp\n' ;;
+  esac
+}
+
+# 探测某个端口/协议当前是否已经在防火墙层放行, 兼容 ufw/firewalld/iptables/nftables
+# 四种后端, 与 open_firewall_port() 判断"用哪个后端"的逻辑保持一致
+_fw_port_allowed() {
+  local port=$1 protocol=$2
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    ufw status 2>/dev/null | grep -qE "^${port}/${protocol}[[:space:]].*ALLOW"
+    return $?
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "${port}/${protocol}"
+    return $?
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null
+    return $?
+  fi
+  if command -v nft >/dev/null 2>&1 && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    nft list chain inet "$NFT_TABLE" input 2>/dev/null | grep -qE "${protocol} dport ${port} accept"
+    return $?
+  fi
+  return 1
+}
+
+# 检查并修复孤儿节点: 
+#   1) config.json 里的 inbound tag <-> connections.json 里的 tag 对账
+#   2) 每个监听中的入站, 检查其端口/协议是否真的在防火墙层放行
+# 全程只报告, 发现问题后逐项 confirm 才会真正改动, 不做静默清理
+reconcile_nodes() {
+  ensure_installed
+  title "检查并修复孤儿节点 (reconcile)"
+
+  local -a inbound_tags=() conn_tags=()
+  mapfile -t inbound_tags < <(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" 2>/dev/null)
+  mapfile -t conn_tags < <(jq -r '.connections[]?.tag' "$STATE_FILE" 2>/dev/null)
+
+  local -a orphan_inbounds=() orphan_conns=()
+  local t c found
+
+  # config 里有 inbound, 但 connections.json 里找不到对应记录
+  # (典型场景: 部署过程中被 SIGINT/SIGTERM 打断, PENDING_TAG 提示过的那种情况)
+  for t in "${inbound_tags[@]}"; do
+    found=0
+    for c in "${conn_tags[@]}"; do [[ $t == "$c" ]] && { found=1; break; }; done
+    (( found == 0 )) && orphan_inbounds+=("$t")
+  done
+
+  # connections.json 里有记录, 但 config 里已经没有对应 inbound 了
+  # (典型场景: 手动删过 inbound 但连接记录没跟着清理, 或本函数上一次没清理完)
+  for t in "${conn_tags[@]}"; do
+    found=0
+    for c in "${inbound_tags[@]}"; do [[ $t == "$c" ]] && { found=1; break; }; done
+    (( found == 0 )) && orphan_conns+=("$t")
+  done
+
+  if (( ${#orphan_inbounds[@]} == 0 && ${#orphan_conns[@]} == 0 )); then
+    ok "未发现孤儿节点, config.json 与 connections.json 对账一致。"
+  fi
+
+  # --- 处理孤儿 inbound (config 有, 连接记录没有) ---
+  for t in "${orphan_inbounds[@]}"; do
+    warn "孤儿入站: [${t}] 存在于 config.json, 但没有对应的连接记录。"
+    if confirm "是否删除该入站节点及其分流规则 (等同于 remove_inbound)" N; then
+      local listen_port
+      listen_port=$(jq -r --arg tag "$t" '.inbounds[] | select(.tag == $tag) | .listen_port // empty' "$CONFIG_FILE")
+      local candidate
+      candidate=$(mktemp)
+      jq --arg tag "$t" '
+        .inbounds |= map(select(.tag != $tag)) |
+        if .route.rules then .route.rules |= map(select((.inbound // []) | index($tag) | not)) else . end
+      ' "$CONFIG_FILE" > "$candidate"
+      apply_candidate "$candidate"
+      rm -f "$candidate"
+      if [[ -n $listen_port ]]; then
+        close_firewall_port "$listen_port" tcp
+        close_firewall_port "$listen_port" udp
+      fi
+      ok "已删除孤儿入站 [${t}]。"
+    else
+      warn "已跳过 [${t}], 保留原样。"
+    fi
+  done
+
+  # --- 处理孤儿连接记录 (connections.json 有, inbound 没有) ---
+  for t in "${orphan_conns[@]}"; do
+    warn "孤儿连接记录: [${t}] 存在于 connections.json, 但没有对应的 inbound。"
+    if confirm "是否清理该条连接记录" N; then
+      atomic_json_update "$STATE_FILE" '.connections |= map(select(.tag != $tag))' --arg tag "$t" \
+        && ok "已清理连接记录 [${t}]。"
+    else
+      warn "已跳过 [${t}], 保留原样。"
+    fi
+  done
+
+  # --- 防火墙对账: 每个非 127.0.0.1 监听的 inbound, 检查端口是否真的放行 ---
+  local -a fw_rows=()
+  mapfile -t fw_rows < <(jq -r '.inbounds[]? | select(.listen_port != null and .listen != "127.0.0.1") | "\(.tag)\t\(.type)\t\(.listen_port)"' "$CONFIG_FILE" 2>/dev/null)
+
+  local row tag type port proto missing=0
+  for row in "${fw_rows[@]}"; do
+    IFS=$'\t' read -r tag type port <<<"$row"
+    for proto in $(_inbound_protocols "$type"); do
+      if ! _fw_port_allowed "$port" "$proto"; then
+        missing=1
+        warn "防火墙缺口: 节点 [${tag}] 端口 ${port}/${proto} 未在防火墙层放行。"
+        if confirm "是否现在放行 ${port}/${proto}" Y; then
+          open_firewall_port "$port" "$proto"
+        else
+          warn "已跳过 ${port}/${proto}, 该端口可能无法从外部访问。"
+        fi
+      fi
+    done
+  done
+  (( missing == 0 )) && ok "防火墙对账正常, 所有监听端口均已放行。"
+
+  printf '\n'
+  ok "reconcile 检查完成。"
+}
+
+_conn_field() {  # _conn_field <tag> <字段名>
+  jq -r --arg t "$1" --arg f "$2" '.connections[]|select(.tag==$t)|.[$f]|tostring' "$STATE_FILE"
+}
+
+_conn_save() {   # _conn_save <tag> <新uri> <新host>
+  atomic_json_update "$STATE_FILE" \
+    '(.connections[]|select(.tag==$t)) |= (.uri=$u | .host=$h)' \
+    --arg t "$1" --arg u "$2" --arg h "$3"
+}
+
+SELECTED_NODE_TAG=""
+pick_connection_tag() {
+  if [[ -n $SELECTED_NODE_TAG ]]; then printf '%s' "$SELECTED_NODE_TAG"; SELECTED_NODE_TAG=""; return 0; fi
+  local -a tags=(); local i idx
+  mapfile -t tags < <(jq -r '.connections[].tag' "$STATE_FILE")
+  (( ${#tags[@]} > 0 )) || { warn "尚无节点记录。"; return 1; }
+  for i in "${!tags[@]}"; do printf '  %d) %s\n' "$((i+1))" "${tags[$i]}" >&2; done
+  IFS= read -r -e -p "选择节点编号: " idx
+  [[ $idx =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#tags[@]} )) || { warn "无效编号。"; return 1; }
+  printf '%s' "${tags[$((idx-1))]}"
+}
+
+rename_node() {
+  ensure_dirs
+  local tag new_enc old_uri new_uri
+  tag=$(pick_connection_tag) || return 0
+  new_enc=$(ask_node_name "$tag")
+  old_uri=$(jq -r --arg t "$tag" '.connections[]|select(.tag==$t)|.uri' "$STATE_FILE")
+  new_uri="${old_uri%%#*}#${new_enc}"
+  atomic_json_update "$STATE_FILE" \
+    '(.connections[]|select(.tag==$t)|.uri) = $u' --arg t "$tag" --arg u "$new_uri" \
+    && ok "已重命名, 请重新导入客户端 / 刷新订阅。"
+}
+
+# 按协议类型返回需要放行的传输层协议
+_type_protocols() {
+  _proto_fw_protocols "$1"
+}
+
+change_node_port() {
+  ensure_installed
+  local tag type old_port new_port candidate old_uri new_uri p
+  tag=$(pick_connection_tag) || return 0
+  type=$(jq -r --arg t "$tag" '.connections[]|select(.tag==$t)|.type' "$STATE_FILE")
+  [[ $type == vless-ws-cloudflare-tunnel ]] && { warn "Tunnel 节点的端口需同时改 Cloudflare 后台, 请删除后重建。"; return 0; }
+  old_port=$(jq -r --arg t "$tag" '.connections[]|select(.tag==$t)|.port' "$STATE_FILE")
+  new_port=$(ask_port "新的监听端口" "$old_port")
+  [[ $new_port != "$old_port" ]] || return 0
+  ensure_port_available "$new_port"
+
+  candidate=$(mktemp)
+  jq --arg t "$tag" --argjson p "$new_port" \
+    '(.inbounds[]|select(.tag==$t)|.listen_port) = $p' "$CONFIG_FILE" > "$candidate"
+  apply_candidate "$candidate"; rm -f "$candidate"
+
+  old_uri=$(jq -r --arg t "$tag" '.connections[]|select(.tag==$t)|.uri' "$STATE_FILE")
+  new_uri=$(printf '%s' "$old_uri" | sed -E "s/:${old_port}([?#])/:${new_port}\1/")
+  atomic_json_update "$STATE_FILE" \
+    '(.connections[]|select(.tag==$t)) |= (.port=($np|tonumber) | .uri=$u)' \
+    --arg t "$tag" --arg np "$new_port" --arg u "$new_uri"
+
+  for p in $(_type_protocols "$type"); do
+    close_firewall_port "$old_port" "$p"
+    open_firewall_port "$new_port" "$p"
+  done
+  ok "端口已由 ${old_port} 改为 ${new_port}, 新连接串:"
+  print_result_block "$tag" "$new_uri" "$tag"
+}
+
+# 只改客户端连接地址 (IP/域名), 不动服务端配置, 适合换 IP、加 CDN 域名
+change_node_host() {
+  ensure_dirs
+  local tag type old_uri new_host new_fmt new_uri
+  tag=$(pick_connection_tag) || return 0
+  type=$(_conn_field "$tag" type)
+  if [[ $type == vless-ws-cloudflare-tunnel ]]; then
+    warn "Tunnel 节点的域名绑定在 Cloudflare 后台, 请删除后重建。"; return 0
+  fi
+  old_uri=$(_conn_field "$tag" uri)
+  IFS= read -r -e -p "新的客户端连接地址 (IP 或域名): " new_host
+  if ! { valid_ipv4 "$new_host" || valid_ipv6 "$new_host" || valid_hostname "$new_host"; }; then
+    warn "地址格式不正确。"; return 0
+  fi
+  new_fmt=$(format_host_uri "$new_host")
+  new_uri=$(printf '%s' "$old_uri" | sed -E "s~^([A-Za-z0-9]+://[^@]*@)(\[[^]]*\]|[^:/?#]+)~\1${new_fmt}~")
+  _conn_save "$tag" "$new_uri" "$new_host"
+  ok "连接地址已更新, 请重新导入客户端 / 刷新订阅。"
+  print_result_block "$tag" "$new_uri" "$tag"
+}
+
+# 改 Reality / ShadowTLS 的握手伪装域名
+change_reality_domain() {
+  ensure_installed
+  local tag type old_dom new_dom old_uri new_uri candidate filter
+  tag=$(pick_connection_tag) || return 0
+  type=$(_conn_field "$tag" type)
+  case $type in
+    vless-reality*)
+      filter='(.inbounds[]|select(.tag==$t)|.tls) |= (.server_name=$d | .reality.handshake.server=$d)'
+      old_dom=$(jq -r --arg t "$tag" '.inbounds[]|select(.tag==$t)|.tls.server_name' "$CONFIG_FILE") ;;
+    shadowtls*)
+      filter='(.inbounds[]|select(.tag==$t)|.handshake.server) = $d'
+      old_dom=$(jq -r --arg t "$tag" '.inbounds[]|select(.tag==$t)|.tls.server_name // empty' "$CONFIG_FILE") ;;
+    *) warn "该节点不是 Reality / ShadowTLS 类型。"; return 0 ;;
+  esac
+  [[ -n $old_dom ]] || { warn "读取原握手域名失败。"; return 0; }
+  new_dom=$(ask_reality_handshake_domain)
+  [[ $new_dom != "$old_dom" ]] || return 0
+
+  candidate=$(mktemp)
+  jq --arg t "$tag" --arg d "$new_dom" "$filter" "$CONFIG_FILE" > "$candidate"
+  apply_candidate "$candidate"; rm -f "$candidate"
+
+  old_uri=$(_conn_field "$tag" uri)
+  new_uri=${old_uri//"$old_dom"/"$new_dom"}
+  _conn_save "$tag" "$new_uri" "$(_conn_field "$tag" host)"
+  ok "握手域名已由 ${old_dom} 改为 ${new_dom}。"
+  print_result_block "$tag" "$new_uri" "$tag"
+}
+
+# 改 TLS 类节点的域名 (会为新域名申请/选择证书)
+change_tls_domain() {
+  ensure_installed
+  local tag type old_dom new_dom paths cert key candidate old_uri new_uri
+  tag=$(pick_connection_tag) || return 0
+  type=$(_conn_field "$tag" type)
+  case $type in
+      trojan*|vless-tls*|hysteria2*|tuic*|anytls*|naive*) ;;
+    *) warn "该节点不是 TLS 证书类节点。"; return 0 ;;
+  esac
+  old_dom=$(jq -r --arg t "$tag" '.inbounds[]|select(.tag==$t)|.tls.server_name // empty' "$CONFIG_FILE")
+  [[ -n $old_dom ]] || { warn "读取原 TLS 域名失败。"; return 0; }
+  new_dom=$(ask_hostname "新的 TLS 域名 (需已解析到本机)")
+  [[ $new_dom != "$old_dom" ]] || return 0
+  paths=$(obtain_tls_paths "$new_dom")
+  cert=${paths%%|*}; key=${paths#*|}
+
+  candidate=$(mktemp)
+  jq --arg t "$tag" --arg d "$new_dom" --arg c "$cert" --arg k "$key" \
+    '(.inbounds[]|select(.tag==$t)|.tls) |= (.server_name=$d | .certificate_path=$c | .key_path=$k)' \
+    "$CONFIG_FILE" > "$candidate"
+  apply_candidate "$candidate"; rm -f "$candidate"
+
+  old_uri=$(_conn_field "$tag" uri)
+  new_uri=${old_uri//"$old_dom"/"$new_dom"}
+  _conn_save "$tag" "$new_uri" "$new_dom"
+  ok "TLS 域名已由 ${old_dom} 改为 ${new_dom}。旧证书文件未删除。"
+  print_result_block "$tag" "$new_uri" "$tag"
+}
+
+node_edit_menu() {
+  local choice
+  while true; do
+    title "编辑节点"
+        printf '  1) 重命名节点\n  2) 修改监听端口\n  3) 修改客户端连接地址\n  4) 修改握手域名 (Reality/ShadowTLS)\n  5) 修改 TLS 域名 (Trojan/VLESS TLS/Hy2/TUIC/AnyTLS)\n  0) 返回主菜单\n'
+    IFS= read -r -e -p '请选择: ' choice
+    case $choice in
+      1) rename_node ;;
+      2) change_node_port ;;
+      3) change_node_host ;;
+      4) change_reality_domain ;;
+      5) change_tls_domain ;;
+      0) return 0 ;;
+      *) warn "无效的编号选择。" ;;
+    esac
+  done
+}
+validate_and_restart() {
+  ensure_installed
+  sing-box check -c "$CONFIG_FILE"
+  systemctl enable --now sing-box
+  systemctl restart sing-box
+  ok "配置校验通过, sing-box 服务已重启。"
+}
+
+show_status() {
+  ensure_installed
+  local stack v4_status="不可用" v6_status="不可用" public_ipv4 public_ipv6
+  stack=$(detect_network_stack)
+  case "$stack" in
+    dual)   v4_status="可用"; v6_status="可用" ;;
+    v4only) v4_status="可用" ;;
+    v6only) v6_status="可用" ;;
+  esac
+  public_ipv4=$(detect_public_ip || true)
+  public_ipv6=$(detect_public_ipv6 || true)
+  printf '\nsing-box 版本: '; sing-box version | head -n 1
+  printf '出站 IP 版本策略: domain_resolver (dns tag: %s)\n' "$SB_DNS_RESOLVER_TAG"
+  printf '网络栈判定: %s\n' "$stack"
+  printf '外网栈连通性: IPv4 [%s] | IPv6 [%s]\n' "$v4_status" "$v6_status"
+  printf '公网 IPv4: %s\n' "${public_ipv4:-未检测到}"
+  printf '公网 IPv6: %s\n' "${public_ipv6:-未检测到}"
+  printf '\n服务运行状态:\n'
+  systemctl --no-pager --full status sing-box || true
+  printf '\n当前入站与监听:\n'
+  jq -r '.inbounds[]? | "- \(.tag) [\(.type)] 监听 \(.listen // "Detour"):\(.listen_port // "-")"' "$CONFIG_FILE"
+}
+
+show_logs() { journalctl -u sing-box -n 150 --no-pager -o cat; }
+
+health_check() {
+  ensure_installed
+  local failed=0
+  printf '\nsing-box 语法检测: '
+  if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then printf '通过\n'; else printf '失败\n'; failed=1; fi
+  printf 'sing-box 服务状态: '
+  if systemctl is-active --quiet sing-box; then printf '运行中\n'; else printf '未运行\n'; failed=1; fi
+  if command -v cloudflared >/dev/null 2>&1; then
+    printf 'cloudflared 状态: '
+    if systemctl is-active --quiet cloudflared; then printf '运行中\n'; else printf '未运行\n'; failed=1; fi
+  fi
+  if command -v warp-cli >/dev/null 2>&1; then
+    printf 'WARP 状态: '
+    warp-cli --accept-tos status 2>/dev/null | grep -qi Connected && printf '已连接\n' || { printf '未连接\n'; failed=1; }
+  fi
+  printf '\n出站规则列表:\n'
+  jq -r '.outbounds[]? | "- \(.tag) [\(.type)] domain_resolver 策略: \(.domain_resolver.strategy // "默认")"' "$CONFIG_FILE"
+  if (( failed == 0 )); then ok "各项健康检查正常"; else warn "健康检查发现异常, 请运行 'sb logs' 或 'sb diag' 排查。"; fi
+}
+
+update_manager() {
+  local candidate
+  candidate=$(mktemp)
+  info "从远程仓库拉取脚本更新: $SCRIPT_UPDATE_URL"
+  run_with_progress "下载管理脚本更新" curl -fL --proto '=https' --tlsv1.2 "$SCRIPT_UPDATE_URL" -o "$candidate"
+  bash -n "$candidate" || { rm -f "$candidate"; die "下载的脚本语法校验失败, 已拒绝安装。"; }
+  install -D -m 700 "$candidate" "$MANAGER_PATH"
+  rm -f "$candidate"
+  tee "$SHORTCUT_PATH" >/dev/null <<EOF
+#!/usr/bin/env bash
+exec ${MANAGER_PATH} "\$@"
+EOF
+  chmod 755 "$SHORTCUT_PATH"
+  ok "管理脚本更新完毕, 直接输入 sb 即可使用新版本。"
+}
+
+upgrade_sing_box() {
+  ensure_installed
+  info "更新 sing-box 软件包..."
+  # apt-get update 只要任意一个已配置的第三方源 (例如曾经装过的 cloudflared
+  # APT 源) GPG 密钥过期/失效, 整个命令就会以非零退出, 在 set -e 下会连累
+  # sing-box 官方源 (sagernet) 本身没问题也升级不了。这里不因此中断,
+  # 仅告警提示, 成功同步的源 (通常包含 sagernet) 其索引已经落盘可用。
+  if ! run_with_progress "更新 sing-box APT 索引" apt-get update -qq; then
+    warn "apt-get update 部分软件源同步失败 (详见 ${LOG_FILE}), 可能是第三方源 (如 cloudflared) GPG 密钥过期导致, 与 sing-box 官方源无关; 继续尝试升级..."
+  fi
+  run_with_progress "升级 sing-box" apt-get install -y -qq --only-upgrade sing-box
+  validate_and_restart
+  ok "更新完成: $(sing-box version | head -n 1)"
+}
+
+enable_bbr() {
+  require_root
+  local virt
+  virt=$(systemd-detect-virt 2>/dev/null || true)
+  if [[ $virt =~ (lxc|openvz|container) ]]; then
+    warn "检测到当前环境处于容器虚拟化 ($virt), 内核层可能不允许自行修改 TCP 拥塞控制。"
+  fi
+  local sysctl_file="/etc/sysctl.d/99-sing-box-bbr.conf"
+  tee "$sysctl_file" >/dev/null <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+  sysctl --system >/dev/null 2>&1 || warn "sysctl 应用返回警告, 可能需要宿主机内核支持。"
+  ok "已写入 BBR 配置; 当前生效算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)"
+}
+
+restore_backup() {
+  ensure_installed
+  local file candidate
+  file=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.json' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | head -n 1 | cut -d' ' -f2-)
+  [[ -n $file ]] || die "未发现任何可用的备份文件。"
+  warn "将回退到最近的备份: $file"
+  confirm "确认恢复该备份" N || return 0
+  candidate=$(mktemp)
+  install -m 600 "$file" "$candidate"
+  apply_candidate "$candidate"
+  rm -f "$candidate"
+  ok "配置已回滚并成功重启服务。"
+}
+
+uninstall_sing_box() {
+  require_root
+  warn "这将会停止并卸载 sing-box 程序; 现有配置文件和节点连接串将保留在系统内。"
+  confirm "确认卸载 sing-box" N || return 0
+  systemctl disable --now sing-box 2>/dev/null || true
+  apt-get remove -y -qq sing-box
+  ok "sing-box 已卸载完毕; 数据保留目录: ${CONFIG_DIR}, ${STATE_DIR}"
+}
+
+# ===========================================================================
+# 彻底清除: 停服务 + 卸载软件包 + 删除配置/数据/证书/防火墙规则/APT源,
+# 比 uninstall_sing_box() 激进得多 (那个只卸载 sing-box 软件包本身, 配置和
+# 节点数据是故意保留的)。这里是"这台机器上再也不需要这个脚本管理的任何东西"
+# 场景下用的, 不可逆, 全程二次确认。
+# ===========================================================================
+purge_all() {
+  require_root
+  warn "即将彻底清除 sing-box-vps 管理的全部内容:"
+  printf '  - sing-box / cloudflared / cloudflare-warp / certbot 软件包\n'
+  printf '  - %s (配置)\n' "$CONFIG_DIR"
+  printf '  - %s (节点记录/订阅/备份/日志)\n' "$STATE_DIR"
+  printf '  - %s (Cloudflare Tunnel 配置)\n' "$CF_CONFIG_DIR"
+  printf '  - systemd unit / logrotate / cron / certbot 续期钩子\n'
+  printf '  - 本脚本自建的 APT 源与密钥\n'
+  printf '  - 本脚本开过的防火墙放行规则 (iptables/ip6tables/nftables)\n'
+  warn "此操作不可逆, 且不会创建任何备份。"
+  local confirm_text
+  IFS= read -r -e -p "请输入大写 DELETE 以确认继续: " confirm_text
+  [[ $confirm_text == DELETE ]] || { warn "输入不匹配, 已取消。"; return 0; }
+
+  info "停止并禁用相关服务..."
+  systemctl disable --now sing-box sing-box-vps-sub cloudflared warp-svc 2>/dev/null || true
+
+  info "卸载软件包 (sing-box / cloudflared / cloudflare-warp)..."
+  apt-get remove --purge -y sing-box cloudflared cloudflare-warp 2>/dev/null || true
+
+  if command -v certbot >/dev/null 2>&1; then
+    if confirm "是否一并卸载 certbot 并删除全部证书 (如果这台机器上 certbot 还给其他站点用, 选否)" N; then
+      apt-get remove --purge -y certbot 2>/dev/null || true
+      rm -rf /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal
+      rm -f /etc/letsencrypt/renewal-hooks/deploy/restart-sing-box
+      rm -f /etc/cron.d/sing-box-vps-certbot
+      systemctl disable --now certbot.timer 2>/dev/null || true
+    else
+      rm -f /etc/letsencrypt/renewal-hooks/deploy/restart-sing-box
+      info "已跳过 certbot/证书清理, 仅移除了本脚本的续期钩子。"
+    fi
+  fi
+  apt-get autoremove -y 2>/dev/null || true
+
+  info "删除脚本自身与快捷命令..."
+  rm -f "$MANAGER_PATH" "$SHORTCUT_PATH"
+
+  info "删除配置/数据/日志目录..."
+  rm -rf "$CONFIG_DIR" "$STATE_DIR" "$CF_CONFIG_DIR"
+  rm -rf /root/.cloudflared "${HOME}/.cloudflared" 2>/dev/null || true
+  rm -f "$LOCK_FILE"
+
+  info "删除 systemd unit..."
+  rm -f /etc/systemd/system/cloudflared.service "$SUB_HTTPD_UNIT"
+  systemctl daemon-reload
+
+  info "删除 logrotate 配置..."
+  rm -f "$LOGROTATE_FILE"
+
+  info "删除脚本自建的 APT 源与密钥..."
+  rm -f /etc/apt/sources.list.d/sagernet.sources
+  rm -f /etc/apt/sources.list.d/cloudflared.list
+  rm -f /etc/apt/sources.list.d/cloudflare-client.list
+  rm -f /etc/apt/keyrings/sagernet.asc
+  rm -f /usr/share/keyrings/cloudflare-public-v2.gpg
+  rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+  apt-get update -qq 2>/dev/null || true
+
+  if confirm "是否清空本脚本开过的防火墙规则 (会 flush iptables INPUT 链, 如果机器上还有其他服务依赖 iptables 规则, 选否改成手动清理)" N; then
+    iptables -F INPUT 2>/dev/null || true
+    ip6tables -F INPUT 2>/dev/null || true
+    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    persist_iptables_rules
+    ok "防火墙规则已清空。"
+  else
+    warn "已跳过防火墙清理, 请自行用 'iptables -L INPUT -n --line-numbers' 检查并手动删除本脚本开过的规则。"
+  fi
+
+  ok "彻底清除完成。云厂商安全组规则 (如有) 本脚本管不到, 仍需自行去控制台清理。"
+}
+node_management_menu() {
+  local choice action idx tag type port uri name status fw listen proto row i
+  while true; do
+    title "节点管理"
+    printf ' #  状态  协议              端口  防火墙  监听  名称\n'
+    local -a tags=()
+    mapfile -t tags < <(jq -r '.connections[]?.tag' "$STATE_FILE" 2>/dev/null)
+    for i in "${!tags[@]}"; do
+      tag=${tags[$i]}; type=$(_conn_field "$tag" type); port=$(_conn_field "$tag" port); uri=$(_conn_field "$tag" uri)
+      name=$(printf '%s' "$uri" | sed -n 's/.*#//p')
+      proto=${type%%-*}; status='✓'; fw='?'; listen='?'
+      if [[ -n $port ]]; then
+        if _type_protocols "$type" | while IFS= read -r proto; do _fw_port_allowed "$port" "$proto" && exit 0; done; then fw='✓'; else fw='✗'; status='!'; fi
+        if command -v ss >/dev/null 2>&1 && ss -lntu 2>/dev/null | grep -qE ":${port}[[:space:]]"; then listen='✓'; else listen='✗'; status='!'; fi
+      fi
+      printf ' %2d  %s    %-16s %5s    %s      %s   %s\n' "$((i+1))" "$status" "$type" "${port:-—}" "$fw" "$listen" "${name:-$tag}"
+    done
+    printf '\n动作+编号: q二维码 c复制 e编辑 d删除 f修复防火墙 l日志；0返回\n'
+    IFS= read -r -e -p '选择: ' choice || return 0
+    [[ $choice == 0 ]] && return 0
+    [[ $choice =~ ^([qcedfl])([0-9]+)$ ]] || { warn '格式无效，请使用例如 e3 或 q2。'; continue; }
+    action=${BASH_REMATCH[1]}; idx=${BASH_REMATCH[2]}
+    (( idx >= 1 && idx <= ${#tags[@]} )) || { warn '不存在该节点编号。'; continue; }
+    tag=${tags[$((idx-1))]}
+    case $action in
+      q) uri=$(_conn_field "$tag" uri); show_qrcode "$uri" "$tag" ;;
+      c) uri=$(_conn_field "$tag" uri); osc52_copy "$uri"; info '已发送 OSC 52 复制请求。' ;;
+      e) SELECTED_NODE_TAG=$tag; node_edit_menu ;;
+      d) SELECTED_NODE_TAG=$tag; remove_inbound ;;
+      f) port=$(_conn_field "$tag" port); type=$(_conn_field "$tag" type); while IFS= read -r proto; do open_firewall_port "$port" "$proto"; done < <(_type_protocols "$type") ;;
+      l) show_logs ;;
+    esac
+  done
+}
+
+diag_ops_menu() {
+  local choice
+  while true; do
+    title "诊断与运维"
+    printf '  1) 查看服务状态与网络栈\n'
+    printf '  2) 查看实时运行日志\n'
+    printf '  3) 校验配置并重启服务\n'
+    printf '  4) 系统健康检查\n'
+    printf '  5) 系统诊断 (端口/DNS/BBR/防火墙/Tunnel/配置)\n'
+    printf '  6) 检查并修复孤儿节点 (reconcile)\n'
+    printf '  0) 返回主菜单\n'
+    IFS= read -r -e -p '请选择: ' choice
+    case $choice in
+      1) show_status ;;
+      2) show_logs ;;
+      3) validate_and_restart ;;
+      4) health_check ;;
+      5) run_diagnostics ;;
+      6) reconcile_nodes ;;
+      0) return 0 ;;
+      *) warn "无效的编号选择。" ;;
+    esac
+  done
+}
+
+system_maintenance_menu() {
+  local choice
+  while true; do
+    title "系统维护"
+    printf '  1) 证书管理\n'
+    printf '  2) 启用 BBR 拥塞控制\n'
+    printf '  3) 恢复最近一次配置备份\n'
+    printf '  4) 安装 / 修复官方 sing-box 环境\n'
+    printf '  5) 更新 sing-box 核心\n'
+    printf '  6) 从 GitHub 更新本脚本\n'
+    printf '  7) 卸载 sing-box (保留配置/数据)\n'
+    printf '  8) 彻底清除 (软件包+配置+证书+防火墙, 不可逆)\n'
+    printf '  0) 返回主菜单\n'
+    IFS= read -r -e -p '请选择: ' choice
+    case $choice in
+      1) cert_management_menu ;;
+      2) enable_bbr ;;
+      3) restore_backup ;;
+      4) install_sing_box ;;
+      5) upgrade_sing_box ;;
+      6) update_manager ;;
+      7) uninstall_sing_box ;;
+      8) purge_all ;;
+      0) return 0 ;;
+      *) warn "无效的编号选择。" ;;
+    esac
+  done
+}
+
+# ===========================================================================
+# 菜单交互
+# ===========================================================================
+print_startup_logo() {
+  # 嵌入自 ssh_icon.sh 的 24-bit ANSI 彩色徽标；不依赖外部图像工具。
+  local cols=${COLUMNS:-80} locale=${LC_ALL:-${LANG:-}}
+  if [[ ! -t 1 || -n ${NO_COLOR:-} || $locale != *UTF-8* && $locale != *utf8* ]]; then
+    printf 'LINONO - singbox VPS\n'; return 0
+  fi
+  if (( cols < 60 )); then printf 'ln> linono\n'; return 0; fi
+  if (( cols < 100 )); then printf 'linono | singbox VPS\n'; return 0; fi
+  if [[ ${COLORTERM:-} != *truecolor* && ${COLORTERM:-} != *24bit* ]]; then printf 'LINONO | singbox VPS\n'; return 0; fi
+printf '%b\n' '[38;2;253;253;254m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;253;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;254;253m[48;2;255;254;254m▀[38;2;254;254;253m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;254;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;255;255;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;255;255;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;0;165;254m▀[38;2;253;253;253m[48;2;0;166;254m▀[38;2;254;254;254m[48;2;1;158;254m▀[38;2;255;254;255m[48;2;1;158;254m▀[38;2;253;253;253m[48;2;247;252;255m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;255;255;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;254;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;255;254;254m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;253;253m▀[0m'
+printf '%b\n' '[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;255;255;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;254;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;253;253;253m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;253;253;254m[48;2;255;253;254m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;253;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;255;255;253m▀[38;2;254;254;254m[48;2;255;254;253m▀[38;2;253;254;254m[48;2;255;255;254m▀[38;2;253;254;255m[48;2;255;254;253m▀[38;2;0;164;253m[48;2;0;165;252m▀[38;2;0;165;254m[48;2;0;166;255m▀[38;2;0;156;253m[48;2;0;156;252m▀[38;2;0;156;254m[48;2;2;158;253m▀[38;2;247;251;255m[48;2;247;252;255m▀[38;2;253;254;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;254;254m[48;2;253;253;253m▀[38;2;253;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;255;255;253m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[0m'
+printf '%b\n' '[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;253;253;254m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;253;254;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;253;253;253m▀[38;2;253;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;255;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;5;183;254m[48;2;1;175;248m▀[38;2;0;167;254m[48;2;1;168;254m▀[38;2;1;168;253m[48;2;1;168;254m▀[38;2;0;168;253m[48;2;1;169;255m▀[38;2;1;160;254m[48;2;0;158;253m▀[38;2;0;159;254m[48;2;0;160;254m▀[38;2;1;117;255m[48;2;0;117;254m▀[38;2;0;117;252m[48;2;0;118;254m▀[38;2;247;250;254m[48;2;247;250;255m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;253;254m[48;2;254;253;254m▀[38;2;253;253;254m[48;2;253;254;253m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;253;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;254;254;253m[48;2;254;253;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;253;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;255;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;254;253;253m▀[38;2;179;236;252m[48;2;8;190;254m▀[38;2;1;185;253m[48;2;1;185;253m▀[38;2;0;179;254m[48;2;1;179;254m▀[38;2;1;180;253m[48;2;1;179;254m▀[38;2;0;164;253m[48;2;1;165;254m▀[38;2;0;164;254m[48;2;0;164;254m▀[38;2;0;165;254m[48;2;0;164;254m▀[38;2;1;164;254m[48;2;0;164;252m▀[38;2;0;165;253m[48;2;1;167;255m▀[38;2;1;128;253m[48;2;0;129;253m▀[38;2;0;121;253m[48;2;0;124;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;255;255;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;253;253;253m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;255;254;255m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;255;255;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;254;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[0m'
+printf '%b\n' '[38;2;254;254;253m[48;2;254;253;253m▀[38;2;255;255;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;254;253m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;253;253m▀[38;2;253;254;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;253;253;252m[48;2;241;251;254m▀[38;2;2;199;254m[48;2;1;196;254m▀[38;2;2;198;253m[48;2;0;196;254m▀[38;2;2;196;253m[48;2;0;196;253m▀[38;2;0;176;253m[48;2;0;175;254m▀[38;2;0;174;253m[48;2;0;175;254m▀[38;2;0;166;253m[48;2;0;167;253m▀[38;2;1;168;253m[48;2;0;168;254m▀[38;2;1;168;253m[48;2;0;168;253m▀[38;2;1;168;253m[48;2;1;170;254m▀[38;2;1;114;254m[48;2;1;114;254m▀[38;2;0;115;253m[48;2;0;116;253m▀[38;2;0;117;254m[48;2;0;117;254m▀[38;2;1;101;252m[48;2;0;103;253m▀[38;2;0;94;253m[48;2;0;96;253m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;255;255;255m[48;2;253;8;18m▀[38;2;255;255;255m[48;2;251;6;16m▀[38;2;255;207;206m[48;2;251;7;16m▀[38;2;253;207;205m[48;2;251;8;16m▀[38;2;253;206;204m[48;2;251;9;17m▀[38;2;254;204;202m[48;2;251;9;16m▀[38;2;254;245;242m[48;2;250;14;17m▀[38;2;254;241;240m[48;2;250;14;17m▀[38;2;254;251;250m[48;2;250;22;18m▀[38;2;255;248;245m[48;2;250;24;19m▀[38;2;254;255;255m[48;2;251;32;17m▀[38;2;255;255;255m[48;2;254;43;29m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;253;254;253m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[0m'
+printf '%b\n' '[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;255;254;253m[48;2;253;254;253m▀[38;2;254;253;253m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;254;253;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;255;255;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;253;254;254m[48;2;255;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;250;253;254m▀[38;2;248;252;254m[48;2;6;197;254m▀[38;2;248;253;255m[48;2;2;195;253m▀[38;2;246;252;254m[48;2;1;191;254m▀[38;2;234;247;253m[48;2;1;192;253m▀[38;2;0;194;253m[48;2;1;169;254m▀[38;2;0;197;254m[48;2;0;169;253m▀[38;2;0;197;254m[48;2;1;169;254m▀[38;2;0;177;254m[48;2;0;170;253m▀[38;2;0;175;253m[48;2;0;171;254m▀[38;2;1;167;254m[48;2;1;170;253m▀[38;2;0;168;254m[48;2;0;172;253m▀[38;2;0;167;253m[48;2;0;117;254m▀[38;2;0;169;254m[48;2;0;118;254m▀[38;2;0;113;253m[48;2;0;111;254m▀[38;2;0;117;253m[48;2;0;112;254m▀[38;2;1;116;251m[48;2;0;98;255m▀[38;2;1;103;253m[48;2;253;253;253m▀[38;2;1;98;253m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;253;253m▀[38;2;254;253;254m[48;2;253;251;253m▀[38;2;255;250;250m[48;2;251;9;15m▀[38;2;254;250;249m[48;2;251;7;15m▀[38;2;254;248;249m[48;2;250;7;15m▀[38;2;255;248;249m[48;2;251;7;15m▀[38;2;254;250;249m[48;2;252;7;16m▀[38;2;248;9;21m[48;2;250;6;16m▀[38;2;251;5;16m[48;2;250;5;15m▀[38;2;250;6;15m[48;2;252;7;15m▀[38;2;251;8;16m[48;2;251;8;16m▀[38;2;250;8;16m[48;2;251;8;15m▀[38;2;249;9;17m[48;2;252;10;16m▀[38;2;249;13;17m[48;2;250;13;18m▀[38;2;250;15;18m[48;2;250;14;17m▀[38;2;249;22;18m[48;2;249;21;16m▀[38;2;249;23;18m[48;2;251;21;16m▀[38;2;250;31;17m[48;2;251;32;16m▀[38;2;253;34;25m[48;2;251;32;17m▀[38;2;255;254;253m[48;2;253;48;18m▀[38;2;255;254;254m[48;2;253;49;18m▀[38;2;255;254;254m[48;2;252;53;18m▀[38;2;255;254;254m[48;2;253;53;20m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;253;254m▀[0m'
+printf '%b\n' '[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;254;253;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;254;253;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;253;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;255;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;255;254;254m▀[38;2;254;253;253m[48;2;245;252;254m▀[38;2;255;254;254m[48;2;1;199;253m▀[38;2;250;253;254m[48;2;3;198;253m▀[38;2;5;195;253m[48;2;1;193;254m▀[38;2;3;196;254m[48;2;0;193;253m▀[38;2;0;190;254m[48;2;0;169;254m▀[38;2;1;191;254m[48;2;0;171;254m▀[38;2;0;170;254m[48;2;1;170;254m▀[38;2;0;169;253m[48;2;0;171;254m▀[38;2;0;168;253m[48;2;0;163;254m▀[38;2;0;169;253m[48;2;0;127;254m▀[38;2;0;170;253m[48;2;1;127;255m▀[38;2;0;171;254m[48;2;0;116;253m▀[38;2;0;171;253m[48;2;0;117;254m▀[38;2;0;116;254m[48;2;0;118;253m▀[38;2;0;117;253m[48;2;0;118;252m▀[38;2;1;113;255m[48;2;1;61;243m▀[38;2;0;113;253m[48;2;0;62;241m▀[38;2;0;98;254m[48;2;0;47;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;201;169m▀[38;2;254;254;253m[48;2;253;81;10m▀[38;2;253;254;253m[48;2;254;82;10m▀[38;2;255;254;254m[48;2;253;246;246m▀[38;2;252;9;15m[48;2;255;255;254m▀[38;2;252;8;15m[48;2;253;253;253m▀[38;2;252;6;14m[48;2;254;254;254m▀[38;2;252;7;15m[48;2;253;254;254m▀[38;2;252;7;15m[48;2;253;253;253m▀[38;2;252;7;16m[48;2;253;253;253m▀[38;2;252;7;16m[48;2;253;253;253m▀[38;2;252;8;16m[48;2;254;254;253m▀[38;2;252;9;16m[48;2;253;253;253m▀[38;2;252;8;15m[48;2;253;254;254m▀[38;2;253;11;16m[48;2;254;254;254m▀[38;2;252;15;17m[48;2;253;253;254m▀[38;2;251;14;16m[48;2;254;255;255m▀[38;2;250;20;16m[48;2;252;52;15m▀[38;2;250;21;16m[48;2;250;51;14m▀[38;2;251;32;17m[48;2;252;51;14m▀[38;2;251;34;18m[48;2;251;53;16m▀[38;2;252;48;18m[48;2;250;50;16m▀[38;2;252;47;18m[48;2;252;52;18m▀[38;2;253;54;18m[48;2;250;60;16m▀[38;2;253;50;16m[48;2;252;61;16m▀[38;2;254;254;254m[48;2;253;64;19m▀[38;2;254;255;255m[48;2;252;66;19m▀[38;2;253;254;254m[48;2;253;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;254;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;253;254;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;255;255;254m[48;2;253;254;253m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;255;255;255m[48;2;4;183;251m▀[38;2;1;198;253m[48;2;0;187;253m▀[38;2;1;198;254m[48;2;0;188;253m▀[38;2;1;195;254m[48;2;1;187;254m▀[38;2;0;196;254m[48;2;1;185;253m▀[38;2;1;169;253m[48;2;0;185;254m▀[38;2;0;170;253m[48;2;1;185;254m▀[38;2;0;171;253m[48;2;0;116;254m▀[38;2;1;172;254m[48;2;0;118;253m▀[38;2;1;166;255m[48;2;0;118;253m▀[38;2;1;127;255m[48;2;0;120;253m▀[38;2;0;127;253m[48;2;0;120;253m▀[38;2;0;118;253m[48;2;0;119;254m▀[38;2;0;119;254m[48;2;0;120;254m▀[38;2;1;121;254m[48;2;0;76;250m▀[38;2;0;123;254m[48;2;0;77;247m▀[38;2;0;62;243m[48;2;0;29;213m▀[38;2;0;63;242m[48;2;0;33;216m▀[38;2;0;49;255m[48;2;251;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;255;201;167m[48;2;254;253;253m▀[38;2;254;84;9m[48;2;254;255;254m▀[38;2;254;83;9m[48;2;254;254;253m▀[38;2;254;249;247m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;255;254;254m[48;2;254;254;254m▀[38;2;253;254;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;253;255;255m[48;2;253;254;253m▀[38;2;252;55;16m[48;2;254;254;254m▀[38;2;252;53;16m[48;2;254;255;255m▀[38;2;253;55;16m[48;2;252;74;13m▀[38;2;252;52;16m[48;2;253;76;14m▀[38;2;251;51;17m[48;2;253;75;14m▀[38;2;252;51;18m[48;2;253;78;16m▀[38;2;252;62;17m[48;2;252;77;15m▀[38;2;252;62;17m[48;2;253;76;16m▀[38;2;252;64;17m[48;2;252;63;18m▀[38;2;253;64;19m[48;2;253;66;19m▀[38;2;255;255;255m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;255;254m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;2;182;248m[48;2;0;181;247m▀[38;2;0;188;253m[48;2;0;188;254m▀[38;2;0;187;254m[48;2;0;186;253m▀[38;2;0;186;253m[48;2;0;186;254m▀[38;2;0;186;254m[48;2;0;185;253m▀[38;2;1;185;253m[48;2;0;184;253m▀[38;2;0;184;252m[48;2;0;184;253m▀[38;2;0;116;254m[48;2;0;118;253m▀[38;2;0;117;254m[48;2;0;118;253m▀[38;2;0;119;254m[48;2;0;119;253m▀[38;2;0;120;253m[48;2;0;120;253m▀[38;2;0;122;253m[48;2;0;120;253m▀[38;2;0;121;253m[48;2;0;121;253m▀[38;2;0;121;253m[48;2;0;122;252m▀[38;2;0;79;250m[48;2;0;80;251m▀[38;2;0;79;250m[48;2;0;78;248m▀[38;2;190;193;247m[48;2;255;255;254m▀[38;2;139;156;236m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;252m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;253;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;77;13m[48;2;252;78;15m▀[38;2;252;77;14m[48;2;253;78;15m▀[38;2;252;77;13m[48;2;253;78;15m▀[38;2;251;79;15m[48;2;252;78;15m▀[38;2;252;77;15m[48;2;253;77;16m▀[38;2;252;75;15m[48;2;253;76;16m▀[38;2;252;64;17m[48;2;253;65;17m▀[38;2;253;66;19m[48;2;254;68;18m▀[38;2;254;254;254m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;254;253m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;253;253;253m[48;2;254;254;252m▀[38;2;254;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;252m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;104;239;254m[48;2;3;200;254m▀[38;2;0;198;253m[48;2;1;200;255m▀[38;2;0;162;254m[48;2;0;161;252m▀[38;2;0;160;253m[48;2;0;163;254m▀[38;2;0;162;255m[48;2;0;161;253m▀[38;2;0;148;253m[48;2;0;149;253m▀[38;2;0;149;253m[48;2;0;150;253m▀[38;2;0;116;253m[48;2;0;117;253m▀[38;2;0;117;253m[48;2;0;118;253m▀[38;2;0;116;254m[48;2;0;120;254m▀[38;2;0;119;254m[48;2;0;120;253m▀[38;2;0;120;253m[48;2;0;120;253m▀[38;2;0;119;254m[48;2;0;119;253m▀[38;2;0;121;253m[48;2;0;121;253m▀[38;2;0;99;254m[48;2;0;99;252m▀[38;2;0;99;252m[48;2;0;101;255m▀[38;2;0;30;216m[48;2;0;31;219m▀[38;2;1;32;219m[48;2;0;34;221m▀[38;2;252;255;255m[48;2;255;255;255m▀[38;2;255;254;253m[48;2;254;253;253m▀[38;2;254;253;254m[48;2;253;254;253m▀[38;2;254;253;253m[48;2;254;253;253m▀[38;2;254;253;253m[48;2;253;254;254m▀[38;2;253;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;255;254;254m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;253;253;253m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;93;12m[48;2;254;91;11m▀[38;2;252;91;11m[48;2;253;92;12m▀[38;2;252;90;11m[48;2;252;92;12m▀[38;2;252;91;12m[48;2;252;92;12m▀[38;2;252;91;14m[48;2;253;94;15m▀[38;2;252;92;14m[48;2;253;95;15m▀[38;2;252;77;16m[48;2;255;245;239m▀[38;2;253;79;16m[48;2;255;241;233m▀[38;2;254;254;254m[48;2;254;253;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;254;253m▀[38;2;253;253;253m[48;2;253;254;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;255;255;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;1;187;254m[48;2;0;190;254m▀[38;2;0;186;253m[48;2;0;186;253m▀[38;2;0;157;253m[48;2;0;158;253m▀[38;2;0;156;254m[48;2;1;156;255m▀[38;2;1;155;254m[48;2;0;152;253m▀[38;2;0;119;254m[48;2;0;118;254m▀[38;2;1;119;253m[48;2;0;121;253m▀[38;2;1;118;254m[48;2;0;117;253m▀[38;2;0;119;253m[48;2;0;117;253m▀[38;2;0;119;253m[48;2;0;119;253m▀[38;2;1;121;254m[48;2;0;120;253m▀[38;2;0;120;253m[48;2;0;120;252m▀[38;2;0;113;253m[48;2;2;114;254m▀[38;2;1;113;255m[48;2;1;113;253m▀[38;2;0;42;230m[48;2;0;45;230m▀[38;2;0;42;227m[48;2;1;46;233m▀[38;2;0;49;233m[48;2;1;49;233m▀[38;2;0;50;235m[48;2;0;49;232m▀[38;2;215;225;255m[48;2;226;233;254m▀[38;2;254;253;254m[48;2;254;253;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;253;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;255;252;248m[48;2;255;252;248m▀[38;2;253;140;12m[48;2;253;137;7m▀[38;2;249;133;6m[48;2;253;136;7m▀[38;2;252;108;7m[48;2;253;112;6m▀[38;2;252;108;7m[48;2;253;110;7m▀[38;2;252;102;9m[48;2;253;103;9m▀[38;2;252;101;9m[48;2;253;103;9m▀[38;2;253;95;14m[48;2;254;94;14m▀[38;2;254;96;16m[48;2;254;97;15m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[0m'
+printf '%b\n' '[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;254;253m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;255;255;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;252;27;21m[48;2;251;23;16m▀[38;2;251;24;16m[48;2;251;24;15m▀[38;2;253;29;16m[48;2;253;29;16m▀[38;2;251;39;15m[48;2;252;40;13m▀[38;2;253;45;18m[48;2;253;41;13m▀[38;2;255;245;244m[48;2;254;246;245m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;0;177;253m[48;2;1;179;254m▀[38;2;0;178;255m[48;2;0;177;253m▀[38;2;0;116;253m[48;2;0;116;253m▀[38;2;0;120;253m[48;2;0;119;253m▀[38;2;0;119;254m[48;2;0;119;254m▀[38;2;0;118;253m[48;2;0;116;253m▀[38;2;0;118;253m[48;2;0;118;252m▀[38;2;0;114;253m[48;2;1;117;254m▀[38;2;0;115;253m[48;2;0;117;253m▀[38;2;0;110;252m[48;2;0;112;254m▀[38;2;0;112;254m[48;2;0;112;253m▀[38;2;0;93;254m[48;2;1;97;254m▀[38;2;0;52;237m[48;2;0;50;234m▀[38;2;0;52;239m[48;2;0;50;234m▀[38;2;0;49;232m[48;2;1;52;236m▀[38;2;0;50;233m[48;2;0;52;235m▀[38;2;204;223;252m[48;2;214;230;254m▀[38;2;246;248;254m[48;2;254;254;254m▀[38;2;253;253;255m[48;2;253;253;254m▀[38;2;253;254;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;254;253m[48;2;254;254;252m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;255;255;255m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;163;8m▀[38;2;253;250;238m[48;2;253;160;5m▀[38;2;254;159;7m[48;2;252;159;5m▀[38;2;253;157;6m[48;2;252;160;6m▀[38;2;252;132;4m[48;2;253;136;5m▀[38;2;253;132;6m[48;2;254;137;7m▀[38;2;253;115;8m[48;2;254;116;9m▀[38;2;253;110;5m[48;2;252;100;0m▀[38;2;255;252;250m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;255;254;253m▀[38;2;253;254;253m[48;2;255;255;253m▀[38;2;253;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;253;254m▀[38;2;253;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;255;254;253m▀[38;2;254;245;245m[48;2;250;254;253m▀[38;2;254;16;19m[48;2;251;15;14m▀[38;2;253;21;22m[48;2;252;12;14m▀[38;2;252;44;31m[48;2;252;26;14m▀[38;2;250;23;14m[48;2;253;29;15m▀[38;2;254;171;141m[48;2;253;31;1m▀[38;2;254;157;140m[48;2;254;254;254m▀[38;2;255;242;238m[48;2;254;253;253m▀[38;2;255;243;240m[48;2;254;253;254m▀[38;2;254;252;252m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;255;255;255m▀[38;2;0;151;254m[48;2;0;151;253m▀[38;2;1;149;252m[48;2;1;152;254m▀[38;2;0;114;254m[48;2;0;113;253m▀[38;2;0;117;253m[48;2;0;116;254m▀[38;2;0;118;253m[48;2;0;118;254m▀[38;2;0;118;253m[48;2;0;118;254m▀[38;2;0;118;253m[48;2;1;119;253m▀[38;2;0;117;253m[48;2;1;120;253m▀[38;2;1;116;252m[48;2;0;119;253m▀[38;2;0;46;233m[48;2;0;48;233m▀[38;2;0;48;234m[48;2;0;50;232m▀[38;2;0;49;235m[48;2;0;50;234m▀[38;2;0;50;235m[48;2;0;51;233m▀[38;2;0;50;233m[48;2;0;53;235m▀[38;2;0;60;240m[48;2;0;65;242m▀[38;2;0;62;240m[48;2;1;68;244m▀[38;2;97;138;251m[48;2;93;140;249m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;253;254m▀[38;2;253;253;253m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;255;255;253m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;254;252m[48;2;254;252;247m▀[38;2;253;239;169m[48;2;253;190;7m▀[38;2;252;208;77m[48;2;253;190;8m▀[38;2;254;189;8m[48;2;253;190;8m▀[38;2;254;187;8m[48;2;253;189;8m▀[38;2;254;174;4m[48;2;254;176;5m▀[38;2;254;174;4m[48;2;254;175;6m▀[38;2;254;150;3m[48;2;253;151;5m▀[38;2;254;152;9m[48;2;253;151;5m▀[38;2;254;253;252m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;253;253m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;255;255m[48;2;253;182;178m▀[38;2;255;65;66m[48;2;251;13;16m▀[38;2;253;58;58m[48;2;250;10;14m▀[38;2;253;17;20m[48;2;251;11;15m▀[38;2;250;3;12m[48;2;251;14;15m▀[38;2;251;15;14m[48;2;250;20;11m▀[38;2;252;16;14m[48;2;251;27;16m▀[38;2;252;32;17m[48;2;253;252;252m▀[38;2;253;18;5m[48;2;254;254;254m▀[38;2;253;250;250m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;255;254;254m[48;2;254;254;253m▀[38;2;0;151;255m[48;2;2;126;254m▀[38;2;0;148;251m[48;2;0;124;253m▀[38;2;0;115;254m[48;2;0;112;254m▀[38;2;0;116;254m[48;2;0;112;252m▀[38;2;0;117;253m[48;2;0;113;252m▀[38;2;0;118;252m[48;2;0;114;253m▀[38;2;0;119;254m[48;2;0;113;253m▀[38;2;0;118;251m[48;2;1;49;233m▀[38;2;0;118;252m[48;2;0;49;232m▀[38;2;0;49;233m[48;2;0;49;232m▀[38;2;0;50;233m[48;2;0;51;233m▀[38;2;0;51;233m[48;2;1;54;235m▀[38;2;0;52;235m[48;2;0;56;236m▀[38;2;0;54;236m[48;2;1;58;238m▀[38;2;0;67;241m[48;2;0;155;254m▀[38;2;0;69;242m[48;2;1;156;255m▀[38;2;113;158;252m[48;2;115;230;252m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;255;254;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;255;255;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;253;254;253m[48;2;253;254;253m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;253;254;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;255;254;253m▀[38;2;253;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;216;28m▀[38;2;255;254;254m[48;2;252;213;32m▀[38;2;254;255;255m[48;2;253;205;10m▀[38;2;253;253;245m[48;2;254;204;7m▀[38;2;253;191;7m[48;2;253;198;6m▀[38;2;253;191;8m[48;2;253;198;6m▀[38;2;253;192;8m[48;2;253;194;7m▀[38;2;254;190;7m[48;2;254;197;13m▀[38;2;254;178;7m[48;2;255;250;241m▀[38;2;254;176;4m[48;2;255;251;245m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;255;254;254m[48;2;253;254;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;253;253;252m▀[0m'
+printf '%b\n' '[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;255;255;253m▀[38;2;254;254;254m[48;2;254;251;251m▀[38;2;254;253;253m[48;2;250;15;14m▀[38;2;255;253;253m[48;2;251;12;13m▀[38;2;255;252;253m[48;2;250;13;16m▀[38;2;251;10;14m[48;2;251;13;13m▀[38;2;251;11;13m[48;2;252;14;15m▀[38;2;251;13;14m[48;2;251;14;16m▀[38;2;251;14;15m[48;2;252;19;17m▀[38;2;253;29;17m[48;2;254;254;253m▀[38;2;253;22;11m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;251;254;255m[48;2;1;156;254m▀[38;2;251;254;254m[48;2;1;154;254m▀[38;2;0;124;252m[48;2;0;114;254m▀[38;2;0;125;254m[48;2;0;112;253m▀[38;2;0;113;254m[48;2;0;114;253m▀[38;2;1;115;254m[48;2;0;115;254m▀[38;2;0;114;254m[48;2;0;112;252m▀[38;2;0;111;252m[48;2;1;49;233m▀[38;2;1;115;253m[48;2;0;47;231m▀[38;2;0;49;233m[48;2;0;49;233m▀[38;2;0;50;232m[48;2;0;50;233m▀[38;2;0;51;234m[48;2;0;55;236m▀[38;2;0;52;234m[48;2;0;56;236m▀[38;2;0;54;237m[48;2;0;56;237m▀[38;2;0;56;238m[48;2;1;106;254m▀[38;2;0;59;240m[48;2;0;105;252m▀[38;2;0;155;253m[48;2;0;214;254m▀[38;2;0;153;253m[48;2;0;213;253m▀[38;2;122;234;252m[48;2;96;231;250m▀[38;2;253;253;253m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;254;254m[48;2;253;254;254m▀[38;2;253;253;254m[48;2;253;217;9m▀[38;2;255;254;253m[48;2;254;218;10m▀[38;2;254;254;254m[48;2;254;220;13m▀[38;2;254;207;14m[48;2;253;218;10m▀[38;2;254;206;8m[48;2;253;218;11m▀[38;2;254;206;7m[48;2;254;220;11m▀[38;2;254;207;7m[48;2;253;220;17m▀[38;2;254;199;9m[48;2;252;220;104m▀[38;2;254;200;9m[48;2;253;221;102m▀[38;2;254;195;9m[48;2;254;253;253m▀[38;2;254;195;22m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;254;253m[48;2;254;253;254m▀[38;2;254;253;254m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;254;253m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;253;254;254m▀[38;2;254;253;253m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;255;254;254m▀[38;2;253;253;253m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;251;33;16m▀[38;2;253;254;255m[48;2;250;31;14m▀[38;2;251;23;12m[48;2;250;31;13m▀[38;2;251;15;14m[48;2;250;31;14m▀[38;2;251;17;16m[48;2;251;29;16m▀[38;2;252;16;15m[48;2;252;25;14m▀[38;2;252;15;16m[48;2;254;87;83m▀[38;2;252;17;17m[48;2;253;253;253m▀[38;2;254;89;64m[48;2;254;253;254m▀[38;2;254;254;255m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;254;253m▀[38;2;254;253;253m[48;2;254;254;253m▀[38;2;1;157;254m[48;2;0;130;252m▀[38;2;1;154;252m[48;2;0;130;253m▀[38;2;0;113;254m[48;2;0;113;253m▀[38;2;0;114;253m[48;2;1;115;254m▀[38;2;0;115;254m[48;2;0;44;228m▀[38;2;0;117;254m[48;2;1;47;234m▀[38;2;0;115;253m[48;2;0;49;231m▀[38;2;0;47;232m[48;2;0;48;232m▀[38;2;0;48;232m[48;2;0;50;233m▀[38;2;0;49;233m[48;2;0;54;233m▀[38;2;0;50;234m[48;2;0;54;234m▀[38;2;0;56;236m[48;2;0;109;254m▀[38;2;0;55;235m[48;2;1;109;253m▀[38;2;1;55;237m[48;2;0;110;249m▀[38;2;0;105;252m[48;2;3;176;254m▀[38;2;1;106;254m[48;2;1;174;250m▀[38;2;0;212;251m[48;2;162;239;252m▀[38;2;0;214;253m[48;2;151;238;252m▀[38;2;102;231;250m[48;2;203;248;253m▀[38;2;254;253;254m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;254;253m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;255;254;254m[48;2;253;246;30m▀[38;2;254;254;254m[48;2;254;244;23m▀[38;2;254;254;254m[48;2;254;242;23m▀[38;2;254;253;253m[48;2;253;241;19m▀[38;2;253;252;239m[48;2;254;238;17m▀[38;2;254;219;9m[48;2;253;238;16m▀[38;2;254;219;9m[48;2;254;250;182m▀[38;2;253;220;10m[48;2;253;250;178m▀[38;2;254;219;11m[48;2;254;248;201m▀[38;2;255;220;10m[48;2;255;250;201m▀[38;2;254;217;11m[48;2;253;253;253m▀[38;2;254;223;27m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;253;253m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;254;253m[48;2;254;254;253m▀[38;2;253;254;254m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;253;254;254m▀[38;2;253;253;254m[48;2;253;254;253m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;254;254m[48;2;254;253;253m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;255;254;254m▀[38;2;255;253;253m[48;2;252;43;17m▀[38;2;254;252;252m[48;2;251;42;15m▀[38;2;252;37;14m[48;2;251;48;13m▀[38;2;251;36;14m[48;2;250;46;12m▀[38;2;251;34;13m[48;2;252;50;12m▀[38;2;252;36;14m[48;2;252;49;12m▀[38;2;253;31;17m[48;2;254;101;69m▀[38;2;254;23;15m[48;2;253;253;253m▀[38;2;254;228;226m[48;2;253;253;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;253m▀[38;2;254;253;253m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;1;130;253m[48;2;3;134;255m▀[38;2;0;128;253m[48;2;0;130;253m▀[38;2;1;114;254m[48;2;0;113;253m▀[38;2;0;115;252m[48;2;1;115;254m▀[38;2;0;45;232m[48;2;0;47;233m▀[38;2;0;48;231m[48;2;1;49;233m▀[38;2;0;47;231m[48;2;0;48;232m▀[38;2;0;49;232m[48;2;0;50;232m▀[38;2;0;51;233m[48;2;0;50;234m▀[38;2;0;54;235m[48;2;1;54;237m▀[38;2;0;55;235m[48;2;0;55;237m▀[38;2;0;108;253m[48;2;0;108;252m▀[38;2;0;109;253m[48;2;0;109;254m▀[38;2;0;108;254m[48;2;0;108;253m▀[38;2;0;171;252m[48;2;1;174;254m▀[38;2;5;177;254m[48;2;1;173;249m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;252m▀[38;2;254;253;254m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;254;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;247;25m[48;2;254;255;255m▀[38;2;254;246;22m[48;2;254;255;255m▀[38;2;254;243;19m[48;2;254;254;254m▀[38;2;254;243;17m[48;2;254;254;254m▀[38;2;255;241;18m[48;2;253;253;254m▀[38;2;254;240;20m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;255;254;253m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;254;254;254m▀[38;2;251;46;17m[48;2;252;56;11m▀[38;2;251;45;15m[48;2;252;54;12m▀[38;2;252;50;12m[48;2;251;63;10m▀[38;2;252;50;13m[48;2;251;65;9m▀[38;2;252;51;12m[48;2;253;135;7m▀[38;2;254;53;13m[48;2;253;132;7m▀[38;2;254;81;52m[48;2;255;252;249m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;253;254;253m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;253;253;253m▀[38;2;253;254;254m[48;2;254;254;254m▀[38;2;253;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;255;254;253m▀[38;2;250;252;255m[48;2;249;252;254m▀[38;2;2;138;250m[48;2;1;141;254m▀[38;2;3;139;252m[48;2;0;140;252m▀[38;2;0;107;253m[48;2;0;107;252m▀[38;2;0;106;254m[48;2;1;106;254m▀[38;2;0;43;228m[48;2;1;45;232m▀[38;2;0;45;231m[48;2;0;44;228m▀[38;2;0;49;232m[48;2;0;48;231m▀[38;2;0;48;231m[48;2;1;50;232m▀[38;2;1;49;231m[48;2;0;49;231m▀[38;2;0;56;238m[48;2;0;58;238m▀[38;2;0;57;238m[48;2;0;57;240m▀[38;2;0;104;251m[48;2;0;106;254m▀[38;2;0;105;252m[48;2;0;106;253m▀[38;2;1;133;254m[48;2;0;137;253m▀[38;2;0;130;252m[48;2;0;134;253m▀[38;2;0;129;254m[48;2;0;132;254m▀[38;2;0;185;254m[48;2;1;188;254m▀[38;2;4;187;254m[48;2;1;185;252m▀[38;2;254;254;253m[48;2;255;255;255m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;255;255m[48;2;254;254;199m▀[38;2;253;253;253m[48;2;253;249;34m▀[38;2;254;255;255m[48;2;254;248;28m▀[38;2;255;255;255m[48;2;254;246;32m▀[38;2;253;254;254m[48;2;254;250;12m▀[38;2;254;254;254m[48;2;254;250;10m▀[38;2;253;254;253m[48;2;254;248;10m▀[38;2;254;254;254m[48;2;253;249;12m▀[38;2;254;255;255m[48;2;254;251;36m▀[38;2;255;254;255m[48;2;255;251;39m▀[38;2;253;253;253m[48;2;255;253;48m▀[38;2;254;254;253m[48;2;253;250;44m▀[38;2;254;255;255m[48;2;254;245;17m▀[38;2;254;254;254m[48;2;254;245;15m▀[38;2;253;254;254m[48;2;255;238;12m▀[38;2;254;255;255m[48;2;254;238;10m▀[38;2;254;255;254m[48;2;253;237;9m▀[38;2;254;255;254m[48;2;253;236;9m▀[38;2;253;254;254m[48;2;254;216;6m▀[38;2;254;254;254m[48;2;253;215;4m▀[38;2;254;255;255m[48;2;254;217;5m▀[38;2;255;255;255m[48;2;253;218;5m▀[38;2;254;254;255m[48;2;254;217;5m▀[38;2;254;255;255m[48;2;254;217;6m▀[38;2;254;254;254m[48;2;253;217;6m▀[38;2;254;254;255m[48;2;254;217;6m▀[38;2;254;254;255m[48;2;254;217;6m▀[38;2;255;255;255m[48;2;254;218;6m▀[38;2;254;254;254m[48;2;253;217;6m▀[38;2;254;253;254m[48;2;253;216;6m▀[38;2;254;255;255m[48;2;254;215;7m▀[38;2;254;254;254m[48;2;253;214;6m▀[38;2;254;253;253m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;255;255;255m[48;2;254;254;254m▀[38;2;254;59;11m[48;2;254;87;8m▀[38;2;253;58;12m[48;2;253;85;7m▀[38;2;253;68;9m[48;2;253;153;4m▀[38;2;253;68;10m[48;2;254;155;4m▀[38;2;253;130;5m[48;2;253;160;3m▀[38;2;254;133;6m[48;2;252;159;1m▀[38;2;253;253;254m[48;2;255;253;250m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;255;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;255;254;254m▀[38;2;248;252;255m[48;2;253;253;255m▀[38;2;0;143;252m[48;2;0;115;254m▀[38;2;1;144;254m[48;2;0;114;252m▀[38;2;0;107;253m[48;2;0;45;229m▀[38;2;0;104;252m[48;2;0;45;230m▀[38;2;0;43;229m[48;2;0;45;229m▀[38;2;0;45;230m[48;2;0;46;229m▀[38;2;1;48;232m[48;2;0;55;236m▀[38;2;0;50;233m[48;2;0;64;242m▀[38;2;0;49;233m[48;2;0;64;242m▀[38;2;0;59;239m[48;2;0;100;252m▀[38;2;0;60;242m[48;2;0;102;253m▀[38;2;0;108;253m[48;2;0;124;252m▀[38;2;0;106;252m[48;2;7;130;251m▀[38;2;1;139;253m[48;2;253;254;253m▀[38;2;1;137;253m[48;2;254;254;254m▀[38;2;1;136;254m[48;2;254;254;254m▀[38;2;3;190;253m[48;2;254;254;254m▀[38;2;9;191;253m[48;2;253;253;252m▀[38;2;253;253;251m[48;2;253;216;5m▀[38;2;254;254;253m[48;2;255;216;5m▀[38;2;254;255;254m[48;2;253;215;4m▀[38;2;254;253;207m[48;2;253;216;4m▀[38;2;253;247;30m[48;2;254;227;6m▀[38;2;253;250;29m[48;2;253;226;4m▀[38;2;252;249;31m[48;2;253;234;8m▀[38;2;255;251;12m[48;2;254;250;10m▀[38;2;254;250;12m[48;2;255;250;12m▀[38;2;254;249;11m[48;2;253;250;10m▀[38;2;254;249;12m[48;2;254;250;11m▀[38;2;253;251;37m[48;2;254;250;11m▀[38;2;253;251;39m[48;2;254;250;9m▀[38;2;253;251;46m[48;2;253;248;9m▀[38;2;253;251;47m[48;2;254;248;11m▀[38;2;254;245;16m[48;2;254;244;11m▀[38;2;254;246;17m[48;2;253;244;11m▀[38;2;254;239;13m[48;2;255;240;12m▀[38;2;253;239;10m[48;2;254;239;10m▀[38;2;254;237;9m[48;2;254;238;9m▀[38;2;253;236;9m[48;2;253;237;8m▀[38;2;253;215;4m[48;2;254;238;8m▀[38;2;254;216;4m[48;2;254;236;9m▀[38;2;254;216;5m[48;2;253;221;5m▀[38;2;253;217;6m[48;2;254;219;5m▀[38;2;254;217;6m[48;2;253;215;5m▀[38;2;254;216;6m[48;2;253;216;5m▀[38;2;254;217;7m[48;2;253;217;6m▀[38;2;254;216;5m[48;2;254;217;6m▀[38;2;254;218;7m[48;2;253;226;15m▀[38;2;253;219;7m[48;2;253;227;14m▀[38;2;254;218;6m[48;2;254;226;15m▀[38;2;253;217;6m[48;2;253;224;16m▀[38;2;254;216;8m[48;2;255;255;254m▀[38;2;254;216;7m[48;2;253;253;254m▀[38;2;254;253;254m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;88;5m[48;2;255;159;3m▀[38;2;254;87;8m[48;2;254;159;2m▀[38;2;254;155;4m[48;2;253;161;2m▀[38;2;253;156;2m[48;2;253;162;3m▀[38;2;252;162;3m[48;2;254;164;3m▀[38;2;252;161;2m[48;2;254;165;3m▀[38;2;254;254;251m[48;2;253;173;3m▀[38;2;254;254;255m[48;2;254;173;2m▀[38;2;254;254;254m[48;2;253;170;6m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;254;253m[48;2;253;253;254m▀[38;2;254;253;253m[48;2;255;255;255m▀[38;2;255;255;254m[48;2;1;78;247m▀[38;2;250;252;255m[48;2;0;80;250m▀[38;2;0;113;253m[48;2;0;54;239m▀[38;2;0;112;252m[48;2;0;52;236m▀[38;2;1;44;229m[48;2;0;44;230m▀[38;2;0;46;230m[48;2;0;44;229m▀[38;2;0;46;229m[48;2;0;48;233m▀[38;2;0;46;230m[48;2;0;48;232m▀[38;2;0;54;235m[48;2;0;79;250m▀[38;2;0;64;243m[48;2;0;83;252m▀[38;2;1;66;243m[48;2;125;172;254m▀[38;2;0;101;251m[48;2;254;254;254m▀[38;2;2;105;254m[48;2;255;255;255m▀[38;2;1;124;251m[48;2;252;251;140m▀[38;2;6;125;254m[48;2;253;252;135m▀[38;2;255;255;255m[48;2;252;253;141m▀[38;2;254;254;254m[48;2;253;160;2m▀[38;2;254;253;253m[48;2;254;161;3m▀[38;2;254;254;254m[48;2;254;193;3m▀[38;2;253;254;253m[48;2;254;192;5m▀[38;2;253;217;6m[48;2;254;218;5m▀[38;2;254;216;4m[48;2;254;217;5m▀[38;2;254;217;5m[48;2;255;217;6m▀[38;2;253;216;5m[48;2;255;218;6m▀[38;2;253;226;6m[48;2;254;217;5m▀[38;2;254;228;5m[48;2;253;215;4m▀[38;2;254;236;8m[48;2;254;216;6m▀[38;2;253;249;10m[48;2;254;251;12m▀[38;2;253;250;12m[48;2;254;250;12m▀[38;2;254;251;12m[48;2;253;250;12m▀[38;2;254;251;12m[48;2;254;251;13m▀[38;2;254;250;11m[48;2;254;250;12m▀[38;2;254;251;10m[48;2;254;249;11m▀[38;2;254;248;10m[48;2;253;233;8m▀[38;2;254;249;11m[48;2;253;234;8m▀[38;2;254;245;12m[48;2;252;240;10m▀[38;2;253;243;11m[48;2;254;241;10m▀[38;2;254;239;9m[48;2;253;242;10m▀[38;2;253;238;10m[48;2;254;240;9m▀[38;2;254;238;9m[48;2;254;240;10m▀[38;2;253;237;8m[48;2;253;237;8m▀[38;2;254;238;8m[48;2;253;238;8m▀[38;2;253;237;7m[48;2;253;237;9m▀[38;2;254;222;5m[48;2;253;236;10m▀[38;2;254;221;5m[48;2;253;234;9m▀[38;2;253;217;7m[48;2;253;223;8m▀[38;2;254;216;5m[48;2;254;223;8m▀[38;2;255;216;6m[48;2;253;226;10m▀[38;2;254;217;6m[48;2;253;226;10m▀[38;2;254;226;15m[48;2;252;227;15m▀[38;2;253;228;16m[48;2;252;228;15m▀[38;2;254;228;16m[48;2;254;248;184m▀[38;2;254;227;15m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[0m'
+printf '%b\n' '[38;2;253;253;254m[48;2;254;254;253m▀[38;2;254;163;3m[48;2;254;251;246m▀[38;2;254;161;1m[48;2;254;251;245m▀[38;2;254;163;2m[48;2;253;186;6m▀[38;2;254;163;4m[48;2;252;183;4m▀[38;2;253;164;4m[48;2;254;184;3m▀[38;2;254;165;3m[48;2;253;183;3m▀[38;2;253;173;3m[48;2;253;202;6m▀[38;2;253;174;5m[48;2;254;199;5m▀[38;2;253;175;13m[48;2;254;204;9m▀[38;2;253;254;253m[48;2;253;244;20m▀[38;2;254;254;253m[48;2;254;244;16m▀[38;2;255;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;5;85;248m[48;2;11;73;252m▀[38;2;0;80;251m[48;2;0;59;238m▀[38;2;0;54;239m[48;2;0;38;231m▀[38;2;0;53;239m[48;2;0;37;224m▀[38;2;0;45;230m[48;2;0;13;194m▀[38;2;0;45;230m[48;2;0;15;187m▀[38;2;0;47;231m[48;2;249;246;74m▀[38;2;0;50;236m[48;2;253;252;75m▀[38;2;1;80;253m[48;2;252;251;71m▀[38;2;1;84;250m[48;2;253;253;77m▀[38;2;255;253;253m[48;2;252;251;72m▀[38;2;253;254;254m[48;2;253;243;22m▀[38;2;253;253;252m[48;2;252;245;22m▀[38;2;252;252;130m[48;2;253;112;1m▀[38;2;253;253;137m[48;2;254;111;3m▀[38;2;253;255;149m[48;2;253;108;3m▀[38;2;253;159;0m[48;2;253;152;3m▀[38;2;253;160;2m[48;2;253;152;2m▀[38;2;254;196;1m[48;2;252;177;2m▀[38;2;254;193;2m[48;2;253;179;5m▀[38;2;255;220;5m[48;2;253;189;1m▀[38;2;254;218;6m[48;2;253;187;2m▀[38;2;253;216;4m[48;2;254;209;4m▀[38;2;254;217;5m[48;2;253;209;5m▀[38;2;254;217;6m[48;2;254;208;5m▀[38;2;253;217;4m[48;2;253;208;6m▀[38;2;255;217;6m[48;2;254;208;5m▀[38;2;254;250;12m[48;2;252;228;5m▀[38;2;254;250;12m[48;2;255;231;7m▀[38;2;255;250;13m[48;2;20;211;51m▀[38;2;255;251;12m[48;2;18;212;53m▀[38;2;255;251;13m[48;2;35;217;49m▀[38;2;254;250;12m[48;2;33;210;49m▀[38;2;253;233;8m[48;2;79;222;47m▀[38;2;253;232;7m[48;2;72;225;47m▀[38;2;255;235;9m[48;2;80;224;43m▀[38;2;254;232;7m[48;2;75;225;40m▀[38;2;120;234;33m[48;2;114;234;39m▀[38;2;118;235;36m[48;2;111;232;36m▀[38;2;118;234;35m[48;2;117;233;36m▀[38;2;117;233;38m[48;2;119;232;37m▀[38;2;125;234;32m[48;2;127;233;32m▀[38;2;125;233;33m[48;2;125;232;32m▀[38;2;133;232;32m[48;2;130;232;32m▀[38;2;131;233;31m[48;2;130;233;32m▀[38;2;140;234;32m[48;2;134;232;32m▀[38;2;141;232;31m[48;2;134;232;34m▀[38;2;164;235;35m[48;2;137;232;36m▀[38;2;165;235;36m[48;2;139;233;37m▀[38;2;167;234;37m[48;2;255;254;255m▀[38;2;166;233;41m[48;2;253;253;253m▀[38;2;229;249;190m[48;2;253;254;253m▀[38;2;255;255;254m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;255;254;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;255;255;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;186;4m[48;2;252;231;14m▀[38;2;254;185;3m[48;2;254;230;6m▀[38;2;254;183;2m[48;2;253;237;8m▀[38;2;253;184;3m[48;2;253;236;6m▀[38;2;254;202;5m[48;2;253;243;10m▀[38;2;254;204;5m[48;2;253;244;9m▀[38;2;253;203;6m[48;2;254;244;12m▀[38;2;253;245;17m[48;2;253;244;15m▀[38;2;254;244;17m[48;2;254;245;16m▀[38;2;255;254;253m[48;2;254;247;26m▀[38;2;254;254;254m[48;2;254;247;25m▀[38;2;254;254;254m[48;2;254;249;29m▀[38;2;254;254;254m[48;2;253;247;30m▀[38;2;5;64;240m[48;2;252;250;53m▀[38;2;0;60;243m[48;2;252;251;58m▀[38;2;0;41;228m[48;2;251;250;66m▀[38;2;0;40;224m[48;2;252;251;69m▀[38;2;0;12;184m[48;2;254;253;75m▀[38;2;0;13;183m[48;2;253;251;80m▀[38;2;247;247;71m[48;2;253;251;78m▀[38;2;253;251;76m[48;2;254;254;78m▀[38;2;254;253;76m[48;2;252;248;59m▀[38;2;254;251;73m[48;2;254;247;52m▀[38;2;254;252;75m[48;2;253;52;10m▀[38;2;253;241;21m[48;2;253;83;5m▀[38;2;252;162;2m[48;2;253;85;6m▀[38;2;253;114;1m[48;2;253;108;3m▀[38;2;254;112;1m[48;2;254;108;3m▀[38;2;254;114;4m[48;2;253;111;6m▀[38;2;253;153;1m[48;2;253;134;2m▀[38;2;253;153;2m[48;2;254;134;3m▀[38;2;253;181;4m[48;2;254;131;2m▀[38;2;254;179;3m[48;2;255;134;4m▀[38;2;255;193;3m[48;2;253;141;1m▀[38;2;253;190;2m[48;2;254;145;5m▀[38;2;253;208;4m[48;2;5;194;59m▀[38;2;255;209;5m[48;2;4;194;57m▀[38;2;253;209;6m[48;2;4;197;58m▀[38;2;254;208;6m[48;2;3;196;57m▀[38;2;254;209;5m[48;2;4;197;55m▀[38;2;253;230;6m[48;2;9;206;54m▀[38;2;255;233;5m[48;2;11;207;55m▀[38;2;20;211;52m[48;2;21;211;52m▀[38;2;19;212;53m[48;2;20;211;52m▀[38;2;36;215;51m[48;2;37;216;49m▀[38;2;34;217;50m[48;2;36;214;51m▀[38;2;69;222;43m[48;2;62;222;48m▀[38;2;69;224;43m[48;2;61;221;48m▀[38;2;76;223;41m[48;2;69;223;46m▀[38;2;76;223;43m[48;2;69;222;46m▀[38;2;113;233;34m[48;2;67;222;49m▀[38;2;113;233;36m[48;2;66;222;47m▀[38;2;118;234;35m[48;2;93;228;41m▀[38;2;119;233;34m[48;2;93;228;43m▀[38;2;130;234;31m[48;2;92;226;42m▀[38;2;131;234;30m[48;2;93;226;42m▀[38;2;133;233;32m[48;2;116;232;39m▀[38;2;132;233;32m[48;2;115;231;39m▀[38;2;134;232;32m[48;2;115;230;41m▀[38;2;137;232;35m[48;2;112;229;37m▀[38;2;138;232;35m[48;2;253;254;251m▀[38;2;138;231;35m[48;2;252;254;251m▀[38;2;255;253;255m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;253;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;253;253;254m[48;2;254;254;254m▀[38;2;255;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;232;6m[48;2;253;253;254m▀[38;2;253;232;10m[48;2;253;253;253m▀[38;2;253;236;9m[48;2;251;245;70m▀[38;2;254;239;10m[48;2;253;246;13m▀[38;2;254;244;12m[48;2;254;244;14m▀[38;2;253;245;13m[48;2;254;246;16m▀[38;2;253;245;15m[48;2;254;247;17m▀[38;2;254;245;16m[48;2;253;246;17m▀[38;2;253;245;17m[48;2;253;245;19m▀[38;2;254;249;26m[48;2;254;247;21m▀[38;2;254;249;28m[48;2;254;247;23m▀[38;2;253;248;31m[48;2;253;247;32m▀[38;2;253;249;32m[48;2;254;249;34m▀[38;2;253;252;56m[48;2;253;248;34m▀[38;2;253;251;59m[48;2;253;249;37m▀[38;2;254;253;70m[48;2;253;250;47m▀[38;2;253;252;72m[48;2;252;248;44m▀[38;2;253;252;80m[48;2;252;45;23m▀[38;2;253;251;82m[48;2;252;31;17m▀[38;2;253;253;81m[48;2;251;36;13m▀[38;2;253;193;32m[48;2;251;46;14m▀[38;2;250;99;12m[48;2;252;47;14m▀[38;2;251;55;9m[48;2;253;55;13m▀[38;2;253;63;11m[48;2;253;58;14m▀[38;2;253;82;5m[48;2;254;75;8m▀[38;2;252;85;6m[48;2;252;78;9m▀[38;2;254;108;3m[48;2;252;90;6m▀[38;2;254;107;3m[48;2;253;88;7m▀[38;2;255;111;6m[48;2;252;90;11m▀[38;2;254;135;3m[48;2;4;168;55m▀[38;2;254;134;3m[48;2;3;166;55m▀[38;2;254;134;4m[48;2;2;173;56m▀[38;2;253;131;3m[48;2;3;174;57m▀[38;2;255;146;4m[48;2;2;181;58m▀[38;2;253;143;3m[48;2;2;181;58m▀[38;2;3;195;60m[48;2;4;192;60m▀[38;2;4;195;60m[48;2;4;194;59m▀[38;2;5;196;61m[48;2;3;195;60m▀[38;2;4;197;60m[48;2;2;194;60m▀[38;2;4;193;59m[48;2;5;194;59m▀[38;2;9;205;55m[48;2;9;203;56m▀[38;2;13;206;54m[48;2;10;203;55m▀[38;2;22;211;52m[48;2;15;208;54m▀[38;2;21;211;51m[48;2;15;208;54m▀[38;2;39;215;49m[48;2;24;213;53m▀[38;2;39;216;51m[48;2;23;210;54m▀[38;2;61;222;45m[48;2;32;213;51m▀[38;2;60;223;44m[48;2;32;214;52m▀[38;2;68;224;43m[48;2;42;216;50m▀[38;2;67;223;45m[48;2;41;217;50m▀[38;2;65;223;44m[48;2;47;217;50m▀[38;2;66;221;46m[48;2;49;217;51m▀[38;2;92;228;40m[48;2;52;217;49m▀[38;2;92;228;40m[48;2;58;217;54m▀[38;2;92;226;42m[48;2;68;220;48m▀[38;2;92;225;42m[48;2;70;220;49m▀[38;2;115;231;37m[48;2;71;220;50m▀[38;2;114;232;38m[48;2;71;220;51m▀[38;2;113;230;39m[48;2;251;254;251m▀[38;2;115;230;45m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;254;253m▀[38;2;254;253;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;247;68m[48;2;254;254;254m▀[38;2;253;246;10m[48;2;254;254;249m▀[38;2;253;246;13m[48;2;254;254;250m▀[38;2;254;246;14m[48;2;254;254;249m▀[38;2;254;248;16m[48;2;255;254;244m▀[38;2;253;247;17m[48;2;253;248;19m▀[38;2;253;247;19m[48;2;253;247;21m▀[38;2;253;247;21m[48;2;253;248;22m▀[38;2;254;248;22m[48;2;253;248;22m▀[38;2;254;249;30m[48;2;254;217;17m▀[38;2;254;249;32m[48;2;252;216;25m▀[38;2;253;251;34m[48;2;250;30;18m▀[38;2;254;250;34m[48;2;250;30;15m▀[38;2;253;131;10m[48;2;251;35;16m▀[38;2;254;102;13m[48;2;252;37;16m▀[38;2;252;35;15m[48;2;253;40;18m▀[38;2;252;38;16m[48;2;253;41;17m▀[38;2;252;44;15m[48;2;253;43;19m▀[38;2;252;45;15m[48;2;254;45;19m▀[38;2;253;51;15m[48;2;253;46;17m▀[38;2;253;53;14m[48;2;254;51;18m▀[38;2;253;58;16m[48;2;251;57;24m▀[38;2;253;76;8m[48;2;3;154;54m▀[38;2;253;80;10m[48;2;4;154;55m▀[38;2;253;96;8m[48;2;4;155;55m▀[38;2;254;96;7m[48;2;3;157;55m▀[38;2;253;94;10m[48;2;3;154;56m▀[38;2;2;170;57m[48;2;2;173;56m▀[38;2;3;169;57m[48;2;1;169;56m▀[38;2;2;175;57m[48;2;2;176;57m▀[38;2;2;176;58m[48;2;2;178;58m▀[38;2;2;182;59m[48;2;3;184;59m▀[38;2;1;181;58m[48;2;2;182;59m▀[38;2;3;192;59m[48;2;4;192;60m▀[38;2;4;194;59m[48;2;4;195;60m▀[38;2;5;197;61m[48;2;5;195;60m▀[38;2;4;197;60m[48;2;4;197;60m▀[38;2;3;194;57m[48;2;4;196;59m▀[38;2;9;203;55m[48;2;3;197;60m▀[38;2;12;204;55m[48;2;3;199;59m▀[38;2;19;209;54m[48;2;6;203;58m▀[38;2;17;212;54m[48;2;6;202;59m▀[38;2;24;211;52m[48;2;11;208;57m▀[38;2;23;213;52m[48;2;9;206;58m▀[38;2;32;214;50m[48;2;19;210;55m▀[38;2;34;215;50m[48;2;18;210;56m▀[38;2;43;218;47m[48;2;24;213;55m▀[38;2;44;217;49m[48;2;24;212;56m▀[38;2;49;217;47m[48;2;30;214;53m▀[38;2;48;217;47m[48;2;30;214;54m▀[38;2;53;218;48m[48;2;33;213;54m▀[38;2;55;218;49m[48;2;29;205;53m▀[38;2;70;222;47m[48;2;252;254;253m▀[38;2;70;221;49m[48;2;253;254;253m▀[38;2;70;222;49m[48;2;253;254;253m▀[38;2;73;222;50m[48;2;253;254;252m▀[38;2;251;254;250m[48;2;253;253;253m▀[38;2;254;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;253;253;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;255;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;253;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;253;253m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;253;254;254m▀[38;2;253;253;253m[48;2;254;253;254m▀[38;2;250;251;252m[48;2;254;254;254m▀[38;2;252;39;21m[48;2;254;28;7m▀[38;2;251;33;18m[48;2;253;27;7m▀[38;2;251;30;18m[48;2;253;24;5m▀[38;2;252;34;20m[48;2;255;24;7m▀[38;2;251;34;19m[48;2;254;40;23m▀[38;2;252;34;18m[48;2;254;39;25m▀[38;2;252;34;18m[48;2;255;38;27m▀[38;2;253;36;19m[48;2;255;40;25m▀[38;2;252;37;18m[48;2;243;44;25m▀[38;2;253;39;19m[48;2;248;45;30m▀[38;2;13;143;58m[48;2;6;152;52m▀[38;2;3;148;54m[48;2;2;153;54m▀[38;2;2;149;55m[48;2;3;154;55m▀[38;2;4;149;53m[48;2;3;154;55m▀[38;2;6;148;54m[48;2;2;154;54m▀[38;2;4;150;54m[48;2;2;153;55m▀[38;2;5;149;54m[48;2;4;154;57m▀[38;2;3;153;55m[48;2;3;157;56m▀[38;2;2;154;55m[48;2;3;157;57m▀[38;2;3;156;56m[48;2;3;160;58m▀[38;2;3;156;56m[48;2;3;161;58m▀[38;2;4;155;57m[48;2;3;162;58m▀[38;2;3;173;58m[48;2;2;171;58m▀[38;2;2;172;55m[48;2;2;172;57m▀[38;2;3;179;58m[48;2;2;179;57m▀[38;2;2;179;58m[48;2;2;180;58m▀[38;2;2;184;59m[48;2;3;183;59m▀[38;2;3;183;59m[48;2;3;183;60m▀[38;2;4;191;60m[48;2;4;187;60m▀[38;2;3;193;59m[48;2;3;190;60m▀[38;2;5;195;60m[48;2;3;192;60m▀[38;2;3;194;58m[48;2;2;192;59m▀[38;2;4;197;59m[48;2;3;192;60m▀[38;2;4;198;60m[48;2;3;193;61m▀[38;2;4;197;59m[48;2;4;193;62m▀[38;2;7;203;58m[48;2;4;200;60m▀[38;2;4;202;58m[48;2;4;200;61m▀[38;2;10;208;56m[48;2;4;198;61m▀[38;2;9;207;55m[48;2;3;197;60m▀[38;2;19;209;53m[48;2;10;204;58m▀[38;2;19;211;55m[48;2;10;207;59m▀[38;2;25;209;53m[48;2;15;209;57m▀[38;2;26;213;56m[48;2;14;204;57m▀[38;2;29;212;53m[48;2;253;254;253m▀[38;2;28;213;54m[48;2;253;254;253m▀[38;2;31;214;54m[48;2;253;254;253m▀[38;2;29;218;57m[48;2;254;254;254m▀[38;2;255;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;255;255;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;254;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;254;253m[48;2;253;253;253m▀[38;2;254;253;253m[48;2;255;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;7;140;50m[48;2;253;254;254m▀[38;2;3;147;52m[48;2;254;254;254m▀[38;2;3;149;52m[48;2;254;253;254m▀[38;2;2;149;53m[48;2;254;254;254m▀[38;2;2;152;54m[48;2;254;253;254m▀[38;2;2;153;55m[48;2;254;254;254m▀[38;2;3;151;56m[48;2;12;165;66m▀[38;2;3;154;55m[48;2;4;156;57m▀[38;2;2;154;55m[48;2;3;156;56m▀[38;2;2;154;56m[48;2;4;155;56m▀[38;2;3;154;56m[48;2;4;157;56m▀[38;2;4;156;56m[48;2;3;156;57m▀[38;2;3;158;58m[48;2;4;158;59m▀[38;2;3;159;57m[48;2;4;163;57m▀[38;2;3;160;58m[48;2;3;164;58m▀[38;2;3;164;59m[48;2;4;170;58m▀[38;2;3;164;58m[48;2;3;169;59m▀[38;2;3;162;58m[48;2;4;169;60m▀[38;2;3;173;59m[48;2;3;172;60m▀[38;2;2;171;58m[48;2;2;170;59m▀[38;2;2;180;58m[48;2;2;176;60m▀[38;2;3;178;58m[48;2;3;174;60m▀[38;2;2;184;58m[48;2;3;182;60m▀[38;2;3;182;60m[48;2;3;182;62m▀[38;2;3;188;59m[48;2;2;181;61m▀[38;2;4;188;60m[48;2;3;184;61m▀[38;2;4;193;61m[48;2;4;188;62m▀[38;2;4;192;60m[48;2;4;188;63m▀[38;2;3;193;60m[48;2;5;190;63m▀[38;2;4;194;61m[48;2;3;193;63m▀[38;2;4;195;60m[48;2;3;193;62m▀[38;2;3;196;59m[48;2;4;196;63m▀[38;2;3;197;59m[48;2;3;195;62m▀[38;2;3;197;60m[48;2;4;197;61m▀[38;2;3;200;60m[48;2;4;195;62m▀[38;2;8;205;58m[48;2;253;254;254m▀[38;2;7;204;58m[48;2;254;254;254m▀[38;2;13;208;58m[48;2;254;254;254m▀[38;2;16;208;59m[48;2;253;252;253m▀[38;2;252;254;252m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;254;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;254;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;254;253;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;254;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;254;254m▀[38;2;12;164;68m[48;2;254;253;253m▀[38;2;3;159;58m[48;2;254;254;254m▀[38;2;4;159;59m[48;2;254;254;254m▀[38;2;4;159;58m[48;2;254;254;254m▀[38;2;4;158;59m[48;2;253;253;253m▀[38;2;3;160;59m[48;2;253;254;253m▀[38;2;3;161;57m[48;2;4;166;59m▀[38;2;2;164;56m[48;2;3;168;59m▀[38;2;3;165;59m[48;2;2;168;58m▀[38;2;3;171;58m[48;2;3;172;60m▀[38;2;3;171;58m[48;2;3;174;59m▀[38;2;4;171;60m[48;2;3;173;58m▀[38;2;2;172;60m[48;2;2;175;59m▀[38;2;2;173;59m[48;2;2;175;59m▀[38;2;3;176;60m[48;2;3;176;59m▀[38;2;2;175;59m[48;2;3;176;59m▀[38;2;2;179;59m[48;2;2;177;60m▀[38;2;3;182;61m[48;2;2;178;61m▀[38;2;3;184;60m[48;2;4;182;61m▀[38;2;4;184;62m[48;2;3;182;61m▀[38;2;3;187;61m[48;2;3;183;61m▀[38;2;3;188;62m[48;2;2;184;62m▀[38;2;3;187;62m[48;2;4;181;63m▀[38;2;4;198;65m[48;2;253;254;253m▀[38;2;3;195;63m[48;2;254;254;254m▀[38;2;3;195;64m[48;2;254;254;254m▀[38;2;2;196;62m[48;2;254;254;254m▀[38;2;4;197;63m[48;2;253;253;254m▀[38;2;1;197;62m[48;2;254;254;254m▀[38;2;253;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;253;253m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[0m'
+printf '%b\n' '[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;254;253;253m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;254;254;253m▀[38;2;255;254;254m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;254;253;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;253m▀[38;2;254;253;253m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;253;254;254m▀[38;2;254;254;253m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;253;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;252;254;252m[48;2;253;254;254m▀[38;2;6;172;62m[48;2;254;253;254m▀[38;2;4;168;64m[48;2;254;254;254m▀[38;2;2;169;62m[48;2;254;254;254m▀[38;2;3;174;63m[48;2;253;254;253m▀[38;2;2;173;60m[48;2;254;254;253m▀[38;2;2;175;61m[48;2;254;254;254m▀[38;2;2;175;63m[48;2;253;253;253m▀[38;2;3;177;65m[48;2;253;254;253m▀[38;2;3;178;64m[48;2;253;253;253m▀[38;2;3;178;64m[48;2;254;254;253m▀[38;2;4;179;64m[48;2;254;254;253m▀[38;2;4;179;64m[48;2;253;253;253m▀[38;2;4;181;64m[48;2;253;253;253m▀[38;2;2;182;64m[48;2;254;254;254m▀[38;2;2;183;65m[48;2;254;254;254m▀[38;2;2;183;64m[48;2;253;253;253m▀[38;2;2;184;64m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;254;253m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;254;253;254m▀[38;2;254;254;254m[48;2;254;253;253m▀[38;2;253;253;253m[48;2;253;253;253m▀[38;2;254;254;254m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;253;254;253m▀[38;2;253;254;254m[48;2;253;254;253m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;253;253;254m[48;2;254;254;254m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;253;253;253m▀[38;2;254;254;253m[48;2;254;254;253m▀[38;2;254;254;253m[48;2;253;253;254m▀[38;2;254;253;253m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;254;254;254m[48;2;254;254;253m▀[38;2;253;253;253m[48;2;253;253;254m▀[38;2;254;254;254m[48;2;254;254;254m▀[38;2;253;253;254m[48;2;253;253;253m▀[38;2;253;253;254m[48;2;255;255;253m▀[38;2;254;254;253m[48;2;254;253;254m▀[0m'
+}
+
+# Root menu data: number|label|description|handler
+MAIN_MENU_ROWS=(
+  '1|新建节点|快速部署 / 14 种协议|new_nodes_menu'
+  '2|节点列表|查看 / 二维码 / 编辑 / 删除|node_management_menu'
+  '3|订阅与分发|Base64 / Clash / sing-box|subscription_menu'
+  '4|出站与穿透|WARP / Cloudflare Tunnel|egress_menu'
+  '5|诊断与测速|体检 / 对账 / 日志 / 测速|diagnostics_menu'
+  '6|系统维护|证书 / BBR / 备份 / 升级|system_maintenance_menu'
+)
+
+print_main_menu() {
+  local service='未知' nodes=0 ips='' v4='-' v6='-'
+  service=$(systemctl is-active sing-box 2>/dev/null || printf '未知')
+  if [[ -r $STATE_FILE ]]; then nodes=$(jq -r '.connections | length' "$STATE_FILE" 2>/dev/null || printf '0'); fi
+  ips=$(get_cached_public_ips 2>/dev/null || true); v4=${ips%%|*}; v6=${ips#*|}
+  [[ -n $v4 ]] || v4='-'; [[ -n $v6 ]] || v6='-'
+  if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+    printf '\033[1;36m●\033[0m singbox VPS 双栈智能管理 v%s  ' "$SCRIPT_VERSION"
+  else printf '* singbox VPS 双栈智能管理 v%s  ' "$SCRIPT_VERSION"; fi
+  printf '服务 %s  sing-box %s  节点 %s  v4 %s  v6 %s\n' "$service" "$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || printf '?')" "$nodes" "$v4" "$v6"
+  printf '%s\n' '────────────────────────────────────────────────────────────────────────'
+  local row n label desc handler
+  for row in "${MAIN_MENU_ROWS[@]}"; do IFS='|' read -r n label desc handler <<< "$row"; printf ' %s  %-14s  %s  ▸\n' "$n" "$label" "$desc"; done
+  printf ' 0  退出\n'
+  printf '%s\n' '────────────────────────────────────────────────────────────────────────'
+}
+
+read_menu_choice() {
+  local __prompt=$2
+  local -n __target=$1
+  if ! IFS= read -r -e -p "$__prompt" __target; then return 1; fi
+}
+
+run_menu_action() {
+  local fn=$1 rc=0
+  ( MENU_ACTION_ACTIVE=1; "$fn" ) || rc=$?
+  case $fn in
+    node_management_menu|subscription_menu|egress_menu|diagnostics_menu|system_maintenance_menu|new_nodes_menu|warp_menu|cf_tunnel_menu|cert_management_menu|diag_ops_menu) return 0 ;;
+  esac
+  if (( rc != 0 )); then warn "本次操作未完成 (状态码 $rc)，按回车返回菜单（不会退出脚本）"; else printf '\n── 按回车返回菜单 ──'; fi
+  local _pause; IFS= read -r _pause || true
+  return 0
+}
+
+new_nodes_menu() {
+  local c
+  while true; do
+    title '新建节点'
+    printf '  1  快速部署 VLESS Reality (双栈默认流程)\n'
+    printf '  2  Reality 自定义 (IPv4)\n  3  Reality 自定义 (IPv6)\n  4  Reality gRPC\n  5  ShadowTLS v3 + SS2022\n'
+    printf '  6  Shadowsocks 2022 [UDP]\n  7  Snell [sing-box >= 1.14]\n'
+    printf '  8  Trojan  9  VLESS TLS  10 Hysteria2 [UDP]  11 TUIC v5 [UDP]\n  12 AnyTLS  13 NaiveProxy\n  14 Cloudflare Tunnel\n  0 返回\n'
+    read_menu_choice c '请选择: ' || return 0; [[ -z $c ]] && continue
+    case $c in
+      1) run_menu_action deploy_reality_quick ;;
+      2) run_menu_action deploy_reality_v4 ;;
+      3) run_menu_action deploy_reality_v6 ;;
+      4) run_menu_action deploy_vless_reality_grpc ;;
+      5) run_menu_action deploy_shadowtls_ss2022 ;;
+      6) run_menu_action deploy_shadowsocks ;;
+      7) run_menu_action deploy_snell ;;
+      8) run_menu_action deploy_trojan ;;
+      9) run_menu_action deploy_vless ;;
+      10) run_menu_action deploy_hysteria2 ;;
+      11) run_menu_action deploy_tuic ;;
+      12) run_menu_action deploy_anytls ;;
+      13) run_menu_action deploy_naive ;;
+      14) run_menu_action cf_tunnel_menu ;;
+      0) return 0 ;; *) warn '无效选择' ;;
+    esac
+  done
+}
+deploy_reality_quick() {
+  local answer port ips host domain value
+  port=$(quick_reality_port) || { warn '未找到候选端口；请用 Reality 自定义部署。'; return 0; }
+  ips=$(get_cached_public_ips 2>/dev/null || true); host=${ips%%|*}; [[ -n $host ]] || host='自动探测失败'
+  domain=${REALITY_PRESET_DOMAINS[0]}
+  QUICK_PORT=$port; QUICK_HOST=$host; QUICK_DOMAIN=$domain; QUICK_NAME='Reality-dual'
+  while true; do
+    printf '\n快速部署摘要\n  模式: Dual 双栈\n  端口: %s%s\n  握手域名: %s (检查 TLS 1.3)\n  连接地址: %s\n  节点名: %s\n' "$QUICK_PORT" "$([[ $QUICK_PORT == 443 ]] || printf ' (443 占用或手动选择，已顺延)')" "$QUICK_DOMAIN" "$QUICK_HOST" "$QUICK_NAME"
+    printf '回车确认 / e逐项修改 / 0取消\n'
+    IFS= read -r -e -p '选择: ' answer || return 0
+    if [[ $answer == 0 ]]; then return 0
+    elif [[ $answer == e || $answer == E ]]; then
+      IFS= read -r -e -i "$QUICK_PORT" -p '端口: ' value || return 0; value=${value:-$QUICK_PORT}
+      valid_port "$value" || { warn '端口必须为 1-65535'; continue; }
+      if port_is_used_in_config "$value" || { command -v ss >/dev/null 2>&1 && ss -tulnH "sport = :$value" 2>/dev/null | grep -q .; }; then warn "端口 $value 已占用。"; continue; fi
+      QUICK_PORT=$((10#$value))
+      IFS= read -r -e -i "$QUICK_HOST" -p '连接地址: ' value || return 0; value=${value:-$QUICK_HOST}
+      valid_ipv4 "$value" || valid_ipv6 "$value" || valid_hostname "$value" || { warn '连接地址需为有效 IP 或域名。'; continue; }; QUICK_HOST=$value
+      IFS= read -r -e -i "$QUICK_DOMAIN" -p 'Reality 握手域名: ' value || return 0; value=${value:-$QUICK_DOMAIN}
+      valid_hostname "$value" || { warn '握手域名格式无效。'; continue; }; QUICK_DOMAIN=$value
+      IFS= read -r -e -i "$QUICK_NAME" -p '节点名: ' value || return 0; value=${value:-$QUICK_NAME}
+      (( ${#value} <= 64 )) || { warn '节点名最多 64 字符。'; continue; }; QUICK_NAME=$value
+      continue
+    elif [[ -n $answer ]]; then warn '无效选择。'; continue; fi
+    break
+  done
+  QUICK_MODE=1
+  deploy_vless_reality_unified dual
+  QUICK_MODE=0
+}
+deploy_reality_v4() { deploy_vless_reality_unified v4; }
+deploy_reality_v6() { deploy_vless_reality_unified v6; }
+
+egress_menu() {
+  local c; while true; do title '出站与穿透'; printf ' 1 Cloudflare WARP\n 2 Cloudflare Tunnel\n 0 返回\n'; read_menu_choice c '请选择: ' || return 0; case $c in 1) run_menu_action warp_menu;; 2) run_menu_action cf_tunnel_menu;; 0) return 0;; '') :;; *) warn '无效选择';; esac; done
+}
+diagnostics_menu() {
+  local c; while true; do title '诊断与测速'; printf ' 1 系统健康检查\n 2 系统诊断\n 3 节点对账 (reconcile)\n 4 运行日志\n 5 服务器测速\n 6 服务状态\n 0 返回\n'; read_menu_choice c '请选择: ' || return 0; case $c in 1) run_menu_action health_check;; 2) run_menu_action run_diagnostics;; 3) run_menu_action reconcile_nodes;; 4) run_menu_action show_logs;; 5) run_menu_action run_speedtest;; 6) run_menu_action show_status;; 0) return 0;; '') :;; *) warn '无效选择';; esac; done
+}
+
+menu() {
+  local choice handler row n label desc fn
+  MENU_ACTIVE=1; MENU_INTERRUPT_COUNT=0
+  print_startup_logo
+  while true; do
+    print_main_menu
+    if ! read_menu_choice choice '请选择 [1-6, 0 退出]: '; then
+      if (( MENU_INTERRUPT_COUNT == 1 )); then continue; fi
+      MENU_ACTIVE=0; printf '\n'; return 0
+    fi
+    MENU_INTERRUPT_COUNT=0
+    [[ -z $choice ]] && continue
+    if [[ $choice == 0 ]]; then MENU_ACTIVE=0; return 0; fi
+    handler=''
+    for row in "${MAIN_MENU_ROWS[@]}"; do IFS='|' read -r n label desc fn <<< "$row"; if [[ $n == "$choice" ]]; then handler=$fn; break; fi; done
+    if [[ -z $handler ]]; then warn '无效的编号选择。'; continue; fi
+    run_menu_action "$handler"
+  done
+}
+
+CLI_ROWS=(
+  'menu|menu|交互菜单'
+  'install|install_sing_box|安装或修复 sing-box'
+  'reality-dual|deploy_reality_dual_cli|VLESS Reality 双栈'
+  'reality-v4|deploy_reality_v4_cli|VLESS Reality IPv4'
+  'reality-v6|deploy_reality_v6_cli|VLESS Reality IPv6'
+  'reality-grpc|deploy_vless_reality_grpc|VLESS Reality gRPC'
+  'shadowtls|deploy_shadowtls_ss2022|ShadowTLS + SS2022'
+  'ss|deploy_shadowsocks|Shadowsocks 2022'
+  'trojan|deploy_trojan|Trojan TLS'
+  'vless|deploy_vless|VLESS TLS'
+  'hy2|deploy_hysteria2|Hysteria2'
+  'tuic|deploy_tuic|TUIC v5'
+  'anytls|deploy_anytls|AnyTLS'
+  'naive|deploy_naive|NaiveProxy'
+  'snell|deploy_snell|Snell v5/v6'
+  'cftunnel|cf_tunnel_menu|Cloudflare Tunnel'
+  'warp|warp_menu|Cloudflare WARP'
+  'sub|subscription_menu|订阅管理'
+  'speedtest|run_speedtest|服务器测速'
+  'links|show_connections|连接串'
+  'qrcode|show_connection_qrcode|节点二维码'
+  'remove|remove_inbound|删除节点'
+  'status|show_status|服务状态'
+  'logs|show_logs|运行日志'
+  'check|validate_and_restart|配置校验并重启'
+  'health|health_check|健康检查'
+  'diag|run_diagnostics|系统诊断'
+  'certs|cert_management_menu|证书管理'
+  'bbr|enable_bbr|启用 BBR'
+  'rollback|restore_backup|恢复配置备份'
+  'upgrade|upgrade_sing_box|升级 sing-box'
+  'cf-upgrade|upgrade_cloudflared|升级 cloudflared'
+  'self-update|update_manager|更新管理脚本'
+  'edit|node_edit_menu|编辑节点'
+  'reconcile|reconcile_nodes|节点对账'
+  'uninstall|uninstall_sing_box|卸载 sing-box'
+  'purge|purge_all|彻底清除'
+)
+deploy_reality_dual_cli() { deploy_vless_reality_unified dual; }
+deploy_reality_v4_cli() { deploy_vless_reality_unified v4; }
+deploy_reality_v6_cli() { deploy_vless_reality_unified v6; }
+usage() {
+  printf '用法: sb [命令]\n\n'
+  local row cmd fn desc
+  for row in "${CLI_ROWS[@]}"; do IFS='|' read -r cmd fn desc <<< "$row"; printf '  %-16s %s\n' "$cmd" "$desc"; done
+  printf '\n'
+}
+main() {
+  local cmd=${1:-menu} row name fn desc
+  case $cmd in -h|--help|help) usage; return 0;; esac
+  require_root; ensure_dirs
+  exec {LOCK_FD}>"$LOCK_FILE"
+  flock -n "$LOCK_FD" || die "检测到另一个 sb 操作正在进行中，请稍后重试。"
+  for row in "${CLI_ROWS[@]}"; do
+    IFS='|' read -r name fn desc <<< "$row"
+    if [[ $cmd == "$name" ]]; then "$fn"; return $?; fi
+  done
+  usage; return 1
+}
+
+main "$@"
