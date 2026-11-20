@@ -3495,12 +3495,13 @@ print_main_menu() {
   [[ -n $v4 ]] || v4='-'; [[ -n $v6 ]] || v6='-'
   core=$(sing-box version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || printf '?')
   print_startup_logo
-  local locale=${LC_ALL:-${LANG:-}}
-  if [[ -t 1 && -z ${NO_COLOR:-} && ${COLUMNS:-80} -ge 100 && ( $locale == *UTF-8* || $locale == *utf8* ) ]]; then
+  local locale=${LC_ALL:-${LANG:-}} term_cols=${COLUMNS:-0}
+  if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then term_cols=$(tput cols 2>/dev/null || printf '%s' "$term_cols"); fi
+  if [[ -t 1 && -z ${NO_COLOR:-} && ( $locale == *UTF-8* || $locale == *utf8* ) ]] && (( term_cols >= 84 )); then
     # The logo is nine terminal rows tall. Overlay the live status block beside it.
-    printf '\033[4A\033[40G\033[38;5;40m●\033[0m %s  sing-box %s  节点 %s\n' "$service" "$core" "$nodes"
-    printf '\033[40G\033[38;5;45mv4 %s\033[0m\n' "$v4"
-    printf '\033[40G\033[38;5;45mv6 %s\033[0m\n' "$v6"
+    printf '\033[4A\033[36G\033[38;5;40m●\033[0m %s  sing-box %s  节点 %s\n' "$service" "$core" "$nodes"
+    printf '\033[36G\033[38;5;45mv4 %s\033[0m\n' "$v4"
+    printf '\033[36G\033[38;5;45mv6 %s\033[0m\n' "$v6"
     printf '\033[1B\r'
   else
     printf '● %s  sing-box %s  节点 %s  v4 %s  v6 %s\n' "$service" "$core" "$nodes" "$v4" "$v6"
@@ -3678,3 +3679,8 @@ main() {
 }
 
 main "$@"
+
+
+
+
+
