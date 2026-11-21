@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
-# Repository : https://github.com/lino-no/singbox
+# Repository : https://github.com/lisiyong0707/singbox
 #
 # 功能总览:
 #   VLESS Reality / Reality gRPC / ShadowTLS v3+SS2022 / Shadowsocks 2022 /
@@ -61,7 +61,7 @@ readonly SUB_HTTPD_UNIT="/etc/systemd/system/sing-box-vps-sub.service"
 readonly LOCK_FILE="/run/sing-box-vps.lock"
 readonly LOGROTATE_FILE="/etc/logrotate.d/sing-box-vps"
 
-SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lisiyong0707/singbox/main/sb.sh}"
 
 readonly REALITY_PRESET_DOMAINS=(
   "gateway.icloud.com"
@@ -584,12 +584,11 @@ ensure_direct_outbounds() {
 ask_node_network_mode() {
   local stack choice
   stack=$(detect_network_stack)
-  printf "\n当前服务器网络栈: %s\n" "$stack" >&2
-  printf "选择节点接入与出站网络模式:\n" >&2
-  printf "  1) Dual 双栈节点 (监听 ::, 出站优先 IPv6 并自动回退 IPv4)\n" >&2
-  printf "  2) IPv4 专用节点 (监听 0.0.0.0, 出站强制仅使用 IPv4)\n" >&2
-  printf "  3) IPv6 严格节点 (监听 ::, 出站强制仅使用 IPv6, 不回退 IPv4)\n" >&2
-  read -e -r -i 1 -p "请选择: " choice || die "输入已取消。"
+  ui_choices "网络模式" "当前网络栈 ${stack}" \
+    "1|Dual 双栈|监听 ::, 出站优先 IPv6, 自动回退 IPv4|默认" \
+    "2|IPv4 专用|监听 0.0.0.0, 出站仅 IPv4|" \
+    "3|IPv6 严格|监听 ::, 出站仅 IPv6, 不回退|"
+  read -e -r -i 1 -p "选择: " choice || die "输入已取消。"
   choice=${choice:-1}
   case "$choice" in
     2)
@@ -1011,12 +1010,13 @@ ask_node_name() {
 # Reality 握手域名: 内置推荐列表 + 自定义, 并做连通性/TLS1.3 粗校验
 ask_reality_handshake_domain() {
   local i choice domain
-  printf "\n选择 Reality 握手伪装域名 (需支持 TLS 1.3, 建议选用大型 CDN/云厂商域名):\n" >&2
+  local -a items=()
   for i in "${!REALITY_PRESET_DOMAINS[@]}"; do
-    printf "  %d) %s\n" "$((i+1))" "${REALITY_PRESET_DOMAINS[$i]}" >&2
+    if (( i == 0 )); then items+=("$((i+1))|${REALITY_PRESET_DOMAINS[$i]}||推荐"); else items+=("$((i+1))|${REALITY_PRESET_DOMAINS[$i]}||"); fi
   done
-  printf "  0) 自定义输入\n" >&2
-  read -e -r -i 1 -p "请选择: " choice || die "输入已取消。"
+  items+=("0|自定义输入||")
+  ui_choices "Reality 握手域名" "需支持 TLS 1.3" "${items[@]}"
+  read -e -r -i 1 -p "选择: " choice || die "输入已取消。"
   choice=${choice:-1}
   if [[ $choice == 0 ]]; then
     domain=$(ask_required "请输入握手域名")
@@ -1078,7 +1078,7 @@ obtain_tls_paths() {
     printf '%s|%s' "$cert" "$key"
     return 0
   fi
-  printf "\nTLS 证书获取方式:\n  1) 使用 Certbot 自动签发 Let's Encrypt (需域名解析到本机且 80 端口开放)\n  2) 使用已有 PEM 证书路径\n" >&2
+  ui_choices "TLS 证书" "" "1|Certbot 自动签发|Let's Encrypt, 需域名解析到本机且 80 端口开放|默认" "2|使用已有 PEM|填写证书与私钥路径|"
   read -e -r -i 1 -p '选择: ' choice
   choice=${choice:-1}
   case $choice in
@@ -1153,24 +1153,6 @@ renew_certificate_now() {
   ok "证书已重新签发: ${domain}"
 }
 
-cert_management_menu() {
-  local choice
-  while true; do
-    title "证书管理"
-    printf '  1) 查看证书到期时间\n'
-    printf '  2) 立即续期 / 重新申请证书\n'
-    printf '  3) 启用/检查 Certbot 自动续期\n'
-    printf '  0) 返回主菜单\n'
-    read -e -r -p '请选择: ' choice
-    case $choice in
-      1) show_certificate_expiry ;;
-      2) renew_certificate_now ;;
-      3) enable_certbot_autorenew ;;
-      0) return 0 ;;
-      *) warn "无效的编号选择。" ;;
-    esac
-  done
-}
 # ---------------------------------------------------------------------------
 # 连接记录存取
 # ---------------------------------------------------------------------------
@@ -1466,8 +1448,8 @@ require_sb_feature_version() {
 
 ask_snell_version() {
   local choice
-  printf '\n选择 Snell 协议版本:\n  1) v6 (推荐)\n  2) v5 (兼容旧客户端)\n' >&2
-  read -e -r -i 1 -p '请选择: ' choice
+  ui_choices "Snell 协议版本" "" "1|v6|推荐|默认" "2|v5|兼容旧客户端|"
+  read -e -r -i 1 -p '选择: ' choice
   choice=${choice:-1}
   [[ $choice == 2 ]] && printf '5' || printf '6'
 }
@@ -1600,10 +1582,8 @@ deploy_cloudflare_tunnel() {
   path=$(random_path)
   uuid=$(new_uuid)
 
-  printf "\nTunnel 接入方式:\n" >&2
-  printf "  1) 已在 Zero Trust 后台创建 Tunnel 并拿到 Token (推荐, 快速接入)\n" >&2
-  printf "  2) 使用 cloudflared tunnel create 在本机新建 Tunnel (需已 cloudflared login)\n" >&2
-  read -e -r -i 1 -p "请选择: " use_token
+  ui_choices "Tunnel 接入方式" "" "1|使用 Token|已在 Zero Trust 后台创建 Tunnel 并拿到 Token (推荐)|默认" "2|本机新建 Tunnel|cloudflared tunnel create, 需已 cloudflared login|"
+  read -e -r -i 1 -p "选择: " use_token
   use_token=${use_token:-1}
 
     if [[ $use_token == 1 ]]; then
@@ -1777,34 +1757,6 @@ cf_tunnel_rebind_token() {
   ok "已重新绑定 Tunnel Token 并重启服务。"
 }
 
-cf_tunnel_menu() {
-  local choice
-  while true; do
-    title "Cloudflare Tunnel 管理"
-    printf '  1) 新建 Cloudflare Tunnel + VLESS WS 节点\n'
-    printf '  2) 查看状态\n'
-    printf '  3) 查看日志\n'
-    printf '  4) 重启\n'
-    printf '  5) 停止\n'
-    printf '  6) 重新绑定 Token\n'
-    printf '  7) 卸载\n'
-    printf '  8) 检查 / 升级 cloudflared 版本\n'
-    printf '  0) 返回主菜单\n'
-    read -e -r -p '请选择: ' choice
-    case $choice in
-      1) deploy_cloudflare_tunnel ;;
-      2) cf_tunnel_status ;;
-      3) cf_tunnel_logs ;;
-      4) cf_tunnel_restart ;;
-      5) cf_tunnel_stop ;;
-      6) cf_tunnel_rebind_token ;;
-      7) cf_tunnel_uninstall ;;
-      8) upgrade_cloudflared ;;
-      0) return 0 ;;
-      *) warn "无效的编号选择。" ;;
-    esac
-  done
-}
 # ===========================================================================
 # Cloudflare WARP 出站集成
 # 实现方式: 官方 cloudflare-warp 客户端 (warp-cli), 以 proxy 模式在本机
@@ -1996,24 +1948,6 @@ upgrade_cloudflared() {
   ok "cloudflared 升级完成: $(cloudflared --version 2>/dev/null | head -n1)"
 }
 
-warp_menu() {
-  local choice
-  while true; do
-    title "Cloudflare WARP 管理"
-    printf '  1) 安装并连接 WARP\n'
-    printf '  2) 查看状态\n'
-    printf '  3) 卸载 WARP\n'
-    printf '  0) 返回主菜单\n'
-    read -e -r -p '请选择: ' choice
-    case $choice in
-      1) install_warp ;;
-      2) warp_status ;;
-      3) uninstall_warp ;;
-      0) return 0 ;;
-      *) warn "无效的编号选择。" ;;
-    esac
-  done
-}
 
 # ===========================================================================
 # 测速: 延迟 + 下载 + 上传 (Cloudflare / Google / Microsoft)
@@ -2552,38 +2486,6 @@ sub_serve_stop() {
   ok "订阅本地服务已停止。"
 }
 
-subscription_menu() {
-  local choice
-  while true; do
-    title "订阅系统"
-    printf '  1) 生成 / 刷新全部订阅文件\n'
-    printf '  2) 查看订阅文件路径\n'
-    printf '  3) 启动本地订阅 HTTP 服务 (127.0.0.1)\n'
-    printf '  4) 停止本地订阅 HTTP 服务\n'
-    printf '  5) 删除全部订阅文件\n'
-    printf '  6) 查看 / 重置订阅访问 token\n'
-    printf '  0) 返回主菜单\n'
-    read -e -r -p '请选择: ' choice
-    case $choice in
-      1) sub_build_all ;;
-      2) find "$SUB_DIR" -maxdepth 1 -type f 2>/dev/null | sed 's/^/  - /' ;;
-      3) sub_serve_start ;;
-      4) sub_serve_stop ;;
-      5) confirm "确认删除全部订阅文件" N && rm -f "${SUB_DIR:?}"/* && ok "已清空订阅文件。" ;;
-      6)
-        if [[ -f $SUB_TOKEN_FILE ]]; then
-          printf '当前 token: %s\n' "$(cat "$SUB_TOKEN_FILE")"
-          confirm "是否重置 token (旧链接将立即失效)" N && regenerate_sub_token
-        else
-          ensure_sub_token >/dev/null
-          ok "已生成新 token: $(cat "$SUB_TOKEN_FILE")"
-        fi
-        ;;
-      0) return 0 ;;
-      *) warn "无效的编号选择。" ;;
-    esac
-  done
-}
 # ===========================================================================
 # 节点管理 / 运维
 # ===========================================================================
@@ -2807,7 +2709,7 @@ pick_connection_tag() {
   if [[ -n ${SEL_TAG:-} ]]; then printf '%s' "$SEL_TAG"; return 0; fi
   mapfile -t tags < <(jq -r '.connections[].tag' "$STATE_FILE")
   (( ${#tags[@]} > 0 )) || { warn "尚无节点记录。"; return 1; }
-  for i in "${!tags[@]}"; do printf '  %d) %s\n' "$((i+1))" "${tags[$i]}" >&2; done
+  for i in "${!tags[@]}"; do printf ' %s%2d%s  %s\n' "$CYAN" "$((i+1))" "$NC" "${tags[$i]}" >&2; done
   read -e -r -p "选择节点编号: " idx || return 1
   [[ $idx =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#tags[@]} )) || { warn "无效编号。"; return 1; }
   printf '%s' "${tags[$((idx-1))]}"
@@ -3597,7 +3499,7 @@ ui_splash() {
   local cols size sub i n j pad rw
   local -a right=() comp=() base=()
   cols=$(ui_cols)
-  ui_status_collect; ui_status_text; ui_addr_text
+  ui_status_collect; ui_status_text; ui_addr_text; ui_os_text
   size=""; if (( cols >= 64 )); then size=big; elif (( cols >= 40 )); then size=small; fi
   sub="singbox VPS 双栈智能管理 v${SCRIPT_VERSION}"
   if (( cols < 50 )); then sub="singbox VPS v${SCRIPT_VERSION}"; fi
@@ -3606,7 +3508,7 @@ ui_splash() {
       ui_banner "$cols"
       printf ' %s%s%s\n' "$BOLD" "$sub" "$NC"
       printf ' %s%s%s %s\n' "$UI_ST_COL" "$UI_ST_DOT" "$NC" "$UI_ST_TXT  节点 ${UI_ST_NODES}"
-      printf ' %s\n %s\n\n' "$UI_A4" "$UI_A6"
+      printf ' %s\n %s\n %s\n\n' "$UI_A4" "$UI_A6" "$UI_OS_PLAIN"
       return 0
     fi
     rw=$(( cols - UI_LOGO_W - 2 ))
@@ -3618,9 +3520,9 @@ ui_splash() {
     n=${#UI_LOGO_ROWS[@]}
     local st="${UI_ST_COL}${UI_ST_DOT}${NC} ${UI_ST_TXT}  节点 ${BOLD}${UI_ST_NODES}${NC}"
     if (( n >= 9 )); then
-      base=("" "${comp[0]}" "${comp[1]}" "" "${BOLD}${sub}${NC}" "" "$st" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}")
+      base=("" "${comp[0]}" "${comp[1]}" "" "${BOLD}${sub}${NC}" "" "$st" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}" "$UI_OS_COLOR")
     else
-      base=("${comp[0]}" "${comp[1]}" "${BOLD}${sub}${NC}" "$st" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}")
+      base=("${comp[0]}" "${comp[1]}" "${BOLD}${sub}${NC}" "$st" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}" "$UI_OS_COLOR")
     fi
     pad=$(( (n - ${#base[@]}) / 2 )); if (( pad < 0 )); then pad=0; fi
     printf '\n'
@@ -3637,7 +3539,8 @@ ui_splash() {
   ui_banner "$cols"
   printf ' %s%s%s\n' "$BOLD" "$sub" "$NC"
   printf ' %s%s%s %s  节点 %s\n' "$UI_ST_COL" "$UI_ST_DOT" "$NC" "$UI_ST_TXT" "$UI_ST_NODES"
-  printf ' %s  %s\n\n' "$UI_A4" "$UI_A6"
+  printf ' %s  %s\n' "$UI_A4" "$UI_A6"
+  printf ' %s\n\n' "$UI_OS_COLOR"
   return 0
 }
 
@@ -3645,15 +3548,15 @@ ui_splash() {
 # ===========================================================================
 # 数据驱动菜单: 渲染 / 分发 / 帮助文本 全部由这一张表生成
 #   字段: 类型|分组|编号|小节|标题|说明|函数(可带参数)|CLI 命令名|标志
-#   类型: G=一级菜单项  I=二级菜单项   编号 '-' = 不出现在菜单, 仅保留 CLI
+#   类型: G=一级菜单项  S=子菜单标题 (不在主菜单显示)  I=二级菜单项   编号 '-' = 不出现在菜单, 仅保留 CLI
 #   标志: M=在主 shell 内运行 (自带循环的子菜单)  P=成功后停住等回车 (只读输出)
-#         N=CLI 下不持有互斥锁 (只读命令)   S=醒目标记 (★)
+#         N=CLI 下不持有互斥锁 (只读命令)   S=醒目标记 (★)   D=危险操作 (红色标题)
 #   约定: 字段内不得出现 '|'; CLI 为 '-' 表示没有对应命令行子命令
 # ===========================================================================
 readonly -a SB_MENU=(
   "G|1|1||新建节点|快速部署 / 14 种协议|ui_group_menu 1|-|M"
   "G|2|2||节点列表|查看 / 二维码 / 编辑 / 删除|node_list_menu|nodes|M"
-  "G|3|3||订阅与分发|Base64 / Clash / sing-box|subscription_menu|sub|"
+  "G|3|3||订阅与分发|Base64 / Clash / sing-box|ui_group_menu 3|sub|M"
   "G|4|4||出站与穿透|WARP / Cloudflare Tunnel|ui_group_menu 4|-|M"
   "G|5|5||诊断与测速|体检 / 对账 / 日志 / 测速|ui_group_menu 5|-|M"
   "G|6|6||系统维护|证书 / BBR / 备份 / 升级|ui_group_menu 6|-|M"
@@ -3670,8 +3573,8 @@ readonly -a SB_MENU=(
   "I|1|11|需要域名 + 证书|AnyTLS||deploy_anytls|anytls|"
   "I|1|12|需要域名 + 证书|NaiveProxy||deploy_naive|naive|"
   "I|1|13|穿透|Cloudflare Tunnel + VLESS WS||deploy_cloudflare_tunnel|-|"
-  "I|4|1||Cloudflare WARP|出站 WARP 管理|warp_menu|warp|"
-  "I|4|2||Cloudflare Tunnel 管理|新建 / 状态 / 日志 / 重启 / 卸载|cf_tunnel_menu|cftunnel|"
+  "I|4|1||Cloudflare WARP|出站 WARP 管理|ui_group_menu 7|warp|M"
+  "I|4|2||Cloudflare Tunnel 管理|新建 / 状态 / 日志 / 重启 / 卸载|ui_group_menu 8|cftunnel|M"
   "I|4|3||升级 cloudflared|检查 / 升级版本|upgrade_cloudflared|cf-upgrade|"
   "I|5|1||服务状态与网络栈|systemd 状态 / 监听 / 公网 IP|show_status|status|PN"
   "I|5|2||运行日志|sing-box 最近 150 行|show_logs|logs|PN"
@@ -3680,7 +3583,7 @@ readonly -a SB_MENU=(
   "I|5|5||系统诊断|端口 / DNS / BBR / 防火墙 / 配置|run_diagnostics|diag|PN"
   "I|5|6||检查并修复孤儿节点|对账 config 与连接记录 (reconcile)|reconcile_nodes|reconcile|"
   "I|5|7||服务器测速|延迟 / 下载 / 上传|run_speedtest|speedtest|P"
-  "I|6|1||证书管理|到期查看 / 立即续期|cert_management_menu|certs|"
+  "I|6|1||证书管理|到期查看 / 立即续期|ui_group_menu 9|certs|M"
   "I|6|2||启用 BBR|拥塞控制|enable_bbr|bbr|"
   "I|6|3||恢复配置备份|回滚到最近一次备份|restore_backup|rollback|"
   "I|6|4||安装 / 修复 sing-box 环境|官方 APT 源|install_sing_box|install|"
@@ -3694,9 +3597,37 @@ readonly -a SB_MENU=(
   "I|0|-||查看客户端连接串||show_connections|links|PN"
   "I|0|-||查看节点二维码||show_connection_qrcode|qrcode|"
   "I|0|-||删除入站节点||remove_inbound|remove|"
-  "I|0|-||编辑节点 (改名/端口/地址/域名)||node_edit_menu|edit|"
+  "I|0|-||编辑节点 (改名/端口/地址/域名)||ui_group_menu 10|edit|M"
+  "S|7|7||Cloudflare WARP|||-|"
+  "S|8|8||Cloudflare Tunnel 管理|||-|"
+  "S|9|9||证书管理|||-|"
+  "S|10|10||编辑节点|||-|"
+  "I|3|1||生成 / 刷新订阅|Base64 / Clash / sing-box|sub_build_all|-|P"
+  "I|3|2||查看订阅文件路径||sub_list_files|-|P"
+  "I|3|3|本地服务|启动订阅服务|127.0.0.1|sub_serve_start|-|"
+  "I|3|4|本地服务|停止订阅服务||sub_serve_stop|-|"
+  "I|3|5|安全|查看 / 重置 token|重置后旧链接立即失效|sub_token_manage|-|"
+  "I|3|6|安全|删除全部订阅文件||sub_delete_all|-|D"
+  "I|7|1||安装并连接|作为出站 outbound|install_warp|-|"
+  "I|7|2||查看状态||warp_status|-|P"
+  "I|7|3||卸载||uninstall_warp|-|D"
+  "I|8|1||新建 Tunnel + VLESS WS 节点||deploy_cloudflare_tunnel|-|"
+  "I|8|2|运行|查看状态||cf_tunnel_status|-|P"
+  "I|8|3|运行|查看日志||cf_tunnel_logs|-|P"
+  "I|8|4|运行|重启||cf_tunnel_restart|-|"
+  "I|8|5|运行|停止||cf_tunnel_stop|-|"
+  "I|8|6|维护|重新绑定 Token||cf_tunnel_rebind_token|-|"
+  "I|8|7|维护|卸载||cf_tunnel_uninstall|-|D"
+  "I|8|8|维护|升级 cloudflared||upgrade_cloudflared|-|"
+  "I|9|1||查看到期时间||show_certificate_expiry|-|P"
+  "I|9|2||立即续期 / 重新申请||renew_certificate_now|-|"
+  "I|9|3||启用 / 检查自动续期|Certbot|enable_certbot_autorenew|-|P"
+  "I|10|1||重命名节点||rename_node|-|"
+  "I|10|2||修改监听端口||change_node_port|-|"
+  "I|10|3||修改连接地址||change_node_host|-|"
+  "I|10|4||修改握手域名|Reality / ShadowTLS|change_reality_domain|-|"
+  "I|10|5||修改 TLS 域名|Trojan / VLESS TLS / Hy2 / TUIC / AnyTLS|change_tls_domain|-|"
 )
-
 R_FUNC=""; R_FLAGS=""; MENU_INT=0; INT_COUNT=0; SEL_TAG=""; MENU_LVL=sub
 
 # 提示符处按 Ctrl+C: 注意 `read -e` 收到被 trap 的 SIGINT 后不会自行返回, 必须在 trap 内
@@ -3817,12 +3748,12 @@ ui_main_draw() {
 
 ui_group_draw() {
   local grp=$1 cols row kind g num sect title desc func cli flags last="" linew=0 cw
-  local line="" cell cellc gtitle="" star
+  local line="" cell cellc gtitle="" star tc
   cols=$(ui_cols)
   ui_find_group "$grp" || true
   for row in "${SB_MENU[@]}"; do
     IFS='|' read -r kind g num sect title desc func cli flags <<<"$row"
-    if [[ $kind == G && $num == "$grp" ]]; then gtitle=$title; fi
+    if [[ ( $kind == G || $kind == S ) && $num == "$grp" ]]; then gtitle=$title; fi
   done
   printf '\n%s%s%s %s %s%s%s\n' "${BOLD}${CYAN}" "$G_H" "$G_H" "$gtitle" "$G_H" "$G_H" "$NC"
   for row in "${SB_MENU[@]}"; do
@@ -3834,14 +3765,15 @@ ui_group_draw() {
       last=$sect
     fi
     star="  "; if [[ $flags == *S* ]]; then star="${YELLOW}${G_STAR}${NC} "; fi
+    tc=$BOLD; if [[ $flags == *D* ]]; then tc=$RED; fi
     if [[ -n $desc ]]; then
       if [[ -n $line ]]; then printf '%s\n' "$line"; line=""; linew=0; fi
-      printf ' %s%s%2s%s  %s' "$star" "$CYAN" "$num" "$NC" "$BOLD"
+      printf '%s%s%2s%s  %s' "$star" "$CYAN" "$num" "$NC" "$tc"
       if (( cols >= 60 )); then printf '%s%s  %s%s%s' "$(ui_pad "$title" 26)" "$NC" "$DIM" "$desc" "$NC"; else printf '%s%s' "$title" "$NC"; fi
       printf '\n'
     else
       cell=$(printf '%2s  %s' "$num" "$title")
-      cellc=$(printf '%s%2s%s  %s' "$CYAN" "$num" "$NC" "$title")
+      cellc=$(printf '%s%2s%s  %s%s%s' "$CYAN" "$num" "$NC" "$([[ $flags == *D* ]] && printf '%s' "$RED")" "$title" "$NC")
       ui_wv "$cell"; cw=$(( UI_WV + 3 ))
       if (( linew > 0 && linew + cw > cols - 3 )); then printf '%s\n' "$line"; line=""; linew=0; fi
       if [[ -z $line ]]; then line="  ${cellc}"; linew=$(( cw + 1 )); else line+="   ${cellc}"; linew=$(( linew + cw )); fi
@@ -3928,6 +3860,7 @@ main() {
     -h|--help|help) if [[ -t 1 ]]; then ui_banner "$(ui_cols)"; fi; usage; return 0 ;;
     -V|--version|version) printf 'sb %s\n' "$SCRIPT_VERSION"; return 0 ;;
   esac
+  ui_os_gate
   require_root
   ensure_dirs
   ensure_shortcut
@@ -4143,7 +4076,7 @@ node_list_menu() {
 }
 
 
-# 编辑菜单: 从节点列表进入 (SEL_TAG 已选定) 只做一次修改并回到列表; CLI 'sb edit' 保持原有循环菜单
+# 编辑菜单: 从节点列表进入 (SEL_TAG 已选定) 只做一次修改并回到列表; CLI 'sb edit' 走 ui_group_menu 10
 node_edit_menu() {
   local choice type label4 fn4 rc=0
   if [[ -n ${SEL_TAG:-} ]]; then
@@ -4155,7 +4088,7 @@ node_edit_menu() {
     title "编辑 ${SEL_TAG}"
     printf '  %s1%s 重命名   %s2%s 修改端口   %s3%s 修改连接地址   %s4%s %s   %s0%s 返回\n' \
       "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$label4" "$CYAN" "$NC"
-    read -e -r -p "请选择: " choice || rc=$?
+    read -e -r -p "选择: " choice || rc=$?
     if (( rc != 0 )); then printf '\n'; return 0; fi
     case ${choice//[[:space:]]/} in
       1) run_action "" rename_node ;;
@@ -4166,20 +4099,7 @@ node_edit_menu() {
     esac
     return 0
   fi
-  while true; do
-    title "编辑节点"
-    printf '  1) 重命名节点\n  2) 修改监听端口\n  3) 修改客户端连接地址\n  4) 修改握手域名 (Reality/ShadowTLS)\n  5) 修改 TLS 域名 (Trojan/VLESS TLS/Hy2/TUIC/AnyTLS)\n  0) 返回\n'
-    read -e -r -p '请选择: ' choice || return 0
-    case $choice in
-      1) rename_node ;;
-      2) change_node_port ;;
-      3) change_node_host ;;
-      4) change_reality_domain ;;
-      5) change_tls_domain ;;
-      0) return 0 ;;
-      *) warn "无效的编号选择。" ;;
-    esac
-  done
+  return 0
 }
 
 # ===========================================================================
@@ -4534,6 +4454,141 @@ show_status() {
   systemctl --no-pager --full status sing-box || true
   printf '\n当前入站与监听:\n'
   jq -r '.inbounds[]? | "- \(.tag) [\(.type)] 监听 \(.listen // "Detour"):\(.listen_port // "-")"' "$CONFIG_FILE"
+}
+
+
+# ===========================================================================
+# 统一风格的选择列表 (提问里的 1/2/3 选项) —— 输出到 stderr, 便于在 $(...) 里使用
+#   ui_choices <标题> <提示> <项...>   项格式: "编号|标题|说明|标记"
+# ===========================================================================
+ui_choices() {
+  local t=$1 hint=$2 cols item n name desc tag
+  shift 2
+  cols=$(ui_cols)
+  printf '\n%s%s%s %s %s%s%s' "${BOLD}${CYAN}" "$G_H" "$G_H" "$t" "$G_H" "$G_H" "$NC" >&2
+  if [[ -n $hint ]]; then printf '  %s%s%s' "$DIM" "$hint" "$NC" >&2; fi
+  printf '\n' >&2
+  for item in "$@"; do
+    IFS='|' read -r n name desc tag <<<"$item"
+    printf ' %s%2s%s  %s%s%s' "$CYAN" "$n" "$NC" "$BOLD" "$(ui_pad "$name" 14)" "$NC" >&2
+    if (( cols >= 60 )) && [[ -n $desc ]]; then printf ' %s%s%s' "$DIM" "$desc" "$NC" >&2; fi
+    if [[ -n $tag ]]; then printf '  %s%s%s' "$GREEN" "$tag" "$NC" >&2; fi
+    printf '\n' >&2
+  done
+  return 0
+}
+
+# ===========================================================================
+# 订阅菜单里原先内联的动作, 拆成独立函数以便经 run_action 隔离
+# ===========================================================================
+sub_list_files() {
+  local out
+  out=$(find "$SUB_DIR" -maxdepth 1 -type f 2>/dev/null | sed 's/^/  - /' || true)
+  if [[ -n $out ]]; then printf '%s\n' "$out"; else warn "尚无订阅文件, 请先生成。"; fi
+  return 0
+}
+
+sub_delete_all() {
+  if confirm "确认删除全部订阅文件" N; then
+    rm -f "${SUB_DIR:?}"/*
+    ok "已清空订阅文件。"
+  fi
+  return 0
+}
+
+sub_token_manage() {
+  if [[ -f $SUB_TOKEN_FILE ]]; then
+    printf '当前 token: %s\n' "$(cat "$SUB_TOKEN_FILE")"
+    if confirm "是否重置 token (旧链接将立即失效)" N; then regenerate_sub_token; fi
+  else
+    ensure_sub_token >/dev/null
+    ok "已生成新 token: $(cat "$SUB_TOKEN_FILE")"
+  fi
+  return 0
+}
+
+# ===========================================================================
+# 系统支持检测: 读一次 /etc/os-release, 不联网, 不新增依赖
+#   启动画面显示  os Debian 12 ✓ ; 有风险 ! 加原因; 不支持 ✗ 并退出, 不做任何修改
+#   SB_SKIP_OS_CHECK=1 可跳过拦截 (不保证可用)
+# ===========================================================================
+UI_OS_LVL=ok; UI_OS_NAME=""; UI_OS_NOTE=""; UI_OS_COLOR=""; UI_OS_PLAIN=""
+ui_os_field() { sed -n "s/^$1=//p" /etc/os-release 2>/dev/null | head -n1 | tr -d '"' || true; }
+
+ui_os_detect() {
+  local id like ver name major arch virt lvl=ok note=""
+  id=$(ui_os_field ID); like=$(ui_os_field ID_LIKE); ver=$(ui_os_field VERSION_ID); name=$(ui_os_field NAME)
+  arch=$(uname -m 2>/dev/null || true)
+  case $id in
+    debian)
+      major=${ver%%.*}
+      UI_OS_NAME="Debian ${ver:-sid}"
+      if [[ $major =~ ^[0-9]+$ ]]; then
+        UI_OS_NAME="Debian ${major}"
+        if (( 10#$major < 11 )); then lvl=warn; note="已过维护期"
+        elif (( 10#$major > 13 )); then lvl=warn; note="版本较新, 未测试"; fi
+      else lvl=warn; note="测试版, 未测试"; fi
+      ;;
+    ubuntu)
+      UI_OS_NAME="Ubuntu ${ver}"
+      case $ver in
+        20.04|22.04|24.04|26.04) ;;
+        *) lvl=warn
+           if [[ $ver =~ ^([0-9]+)\.[0-9]+$ ]] && (( 10#${BASH_REMATCH[1]} < 20 )); then note="已过维护期"; else note="非 LTS, 未测试"; fi ;;
+      esac
+      ;;
+    *)
+      UI_OS_NAME="${name:-${id:-未知系统}} ${ver}"
+      UI_OS_NAME=${UI_OS_NAME% }
+      if [[ " $like " == *" debian "* || " $like " == *" ubuntu "* ]]; then lvl=warn; note="衍生版, 未测试"
+      else lvl=bad; note="不支持"; fi
+      ;;
+  esac
+  if [[ $lvl != bad && ! -d /run/systemd/system ]]; then lvl=bad; note="无 systemd"; fi
+  if [[ $lvl != bad ]] && ! command -v apt-get >/dev/null 2>&1; then lvl=bad; note="无 APT"; fi
+  if [[ $lvl == ok ]]; then
+    case $arch in
+      x86_64|aarch64|arm64|amd64) ;;
+      *) lvl=warn; note="${arch} 架构未测试" ;;
+    esac
+  fi
+  if [[ $lvl == ok ]]; then
+    virt=$(systemd-detect-virt 2>/dev/null || true)
+    case $virt in
+      openvz) lvl=warn; note="OpenVZ 容器" ;;
+      lxc|lxc-libvirt) lvl=warn; note="LXC 容器" ;;
+    esac
+  fi
+  UI_OS_LVL=$lvl; UI_OS_NOTE=$note
+  return 0
+}
+
+ui_os_text() {
+  local icon color
+  ui_os_detect
+  case $UI_OS_LVL in
+    ok)   icon=$G_OK;   color=$GREEN ;;
+    warn) icon=$G_WARN; color=$YELLOW ;;
+    *)    icon=$G_X;    color=$RED ;;
+  esac
+  UI_OS_PLAIN="os ${UI_OS_NAME} ${icon}${UI_OS_NOTE:+ $UI_OS_NOTE}"
+  UI_OS_COLOR="${DIM}os${NC} ${UI_OS_NAME} ${color}${icon}${NC}"
+  if [[ -n $UI_OS_NOTE ]]; then UI_OS_COLOR+=" ${DIM}${UI_OS_NOTE}${NC}"; fi
+  return 0
+}
+
+# 入口拦截: 不支持的系统直接说明并退出, 不进菜单、不写任何配置
+ui_os_gate() {
+  ui_os_text
+  if [[ $UI_OS_LVL != bad || ${SB_SKIP_OS_CHECK:-} == 1 ]]; then return 0; fi
+  printf '\n'
+  ui_banner "$(ui_cols)"
+  printf '\n%s\n' "$UI_OS_COLOR"
+  printf '  本脚本只支持 %sDebian / Ubuntu%s (APT + systemd)。\n' "$BOLD" "$NC"
+  printf '  支持列表: Debian 11 / 12 / 13 · Ubuntu 20.04 / 22.04 / 24.04 / 26.04\n'
+  printf '  已退出, %s未做任何修改%s。\n' "$BOLD" "$NC"
+  printf '  %s如确认环境兼容, 可设置 SB_SKIP_OS_CHECK=1 强制继续 (不保证可用)。%s\n\n' "$DIM" "$NC"
+  exit 1
 }
 
 # 测试 / 以 source 方式引用时设置 SB_SOURCE_ONLY=1 只加载函数而不执行 main
