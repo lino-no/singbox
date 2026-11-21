@@ -4465,7 +4465,7 @@ health_check() {
     if systemctl is-active --quiet cloudflared 2>/dev/null; then dg ok "cloudflared 状态" "运行中"; else dg fail "cloudflared 状态" "未运行"; fi
   fi
   if command -v warp-cli >/dev/null 2>&1; then
-    if warp-cli --accept-tos status 2>/dev/null | grep -qi Connected; then dg ok "WARP 状态" "已连接"; else dg fail "WARP 状态" "未连接"; fi
+    if warp-cli --accept-tos status 2>/dev/null | grep -qE 'Status update:[[:space:]]*Connected'; then dg ok "WARP 状态" "已连接"; else dg fail "WARP 状态" "未连接"; fi
   fi
   printf '\n出站规则列表:\n'
   jq -r '.outbounds[]? | "- \(.tag) [\(.type)] domain_resolver 策略: \(.domain_resolver.strategy // "默认")"' "$CONFIG_FILE"
