@@ -1779,41 +1779,80 @@ install_warp_client() {
   require_apt
   info "配置 Cloudflare WARP 官方 APT 源"
   install -d -m 755 /usr/share/keyrings
-  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-  local codename
-  codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+  local keyring=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg tmp c codename="" sys_codename
+  tmp=$(mktemp)
+  # 旧密钥 (ASCII armor) 需 dearmor; v2 密钥已是二进制, 直接拼接
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor >> "$tmp" 2>/dev/null \
+    || warn "下载 WARP 旧密钥失败"
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg >> "$tmp" 2>/dev/null \
+    || warn "下载 Cloudflare v2 密钥失败"
+  [[ -s $tmp ]] || { rm -f "$tmp"; die "未能获取任何 Cloudflare 签名密钥。"; }
+  install -m 644 "$tmp" "$keyring"    # 必须 644: apt 的 _apt 用户要能读 (脚本 umask 077)
+  rm -f "$tmp"
+
+  sys_codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
+  for c in "$sys_codename" noble jammy; do
+    [[ -n $c ]] || continue
+    if curl -fsI --max-time 8 "https://pkg.cloudflareclient.com/dists/${c}/InRelease" >/dev/null 2>&1; then
+      codename=$c; break
+    fi
+  done
+  [[ -n $codename ]] || die "WARP 官方源没有可用的 dist (已尝试 ${sys_codename:-?}/noble/jammy)。"
+  [[ $codename == "$sys_codename" ]] || warn "WARP 源暂无 ${sys_codename:-当前系统} 的 dist, 回退使用 ${codename}"
+
   tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null <<EOF
-deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
+deb [signed-by=${keyring}] https://pkg.cloudflareclient.com/ ${codename} main
 EOF
-  apt-get update -qq
-  apt-get install -y -qq cloudflare-warp
+  _apt_update_install cloudflare-warp
+}
+
+warp_is_connected() {
+  warp-cli --accept-tos status 2>/dev/null | grep -qE 'Status update:[[:space:]]*Connected'
 }
 
 warp_ensure_registered() {
   systemctl enable --now warp-svc >/dev/null 2>&1 || true
   sleep 2
-  if ! warp-cli --accept-tos status >/dev/null 2>&1; then
-    warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+  if ! warp-cli --accept-tos registration show >/dev/null 2>&1; then
+    warp-cli --accept-tos registration new >/dev/null 2>&1 \
+      || warp-cli --accept-tos register >/dev/null 2>&1 || true
   fi
 }
 
+# 依次尝试 MASQUE 与 WireGuard, 每种协议最多等 20 秒; 成功返回 0
 warp_connect() {
-  # WARP 本身只有"是否连接"的开关, 没有按协议族区分的模式,
-  # 这里固定用 proxy 模式在本机暴露 SOCKS5, 不再提供虚假的 v4/v6/dual 选择
-  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
-  warp-cli --accept-tos proxy port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || true
-  warp-cli --accept-tos connect >/dev/null 2>&1 || true
+  local proto i
+  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli --accept-tos set-mode proxy >/dev/null 2>&1 || true
+  warp-cli --accept-tos proxy port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || warp-cli --accept-tos set-proxy-port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || true
+  for proto in MASQUE WireGuard; do
+    warp-cli --accept-tos tunnel protocol set "$proto" >/dev/null 2>&1 || true
+    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+    sleep 1
+    warp-cli --accept-tos connect >/dev/null 2>&1 || true
+    for i in 1 2 3 4 5 6 7; do
+      sleep 3
+      if warp_is_connected; then info "WARP 已通过 ${proto} 协议连接。"; return 0; fi
+    done
+    warn "WARP 使用 ${proto} 协议 20 秒内未能连接。"
+  done
+  return 1
 }
 
 install_warp() {
   ensure_installed
   command -v warp-cli >/dev/null 2>&1 || install_warp_client
   warp_ensure_registered
-  warp_connect
-  sleep 2
 
-  if ! warp-cli --accept-tos status 2>/dev/null | grep -qi "Connected"; then
-    warn "WARP 客户端未能确认 Connected 状态, 请稍后使用 'sb' 菜单中的 WARP 状态查看。"
+  if ! warp_connect; then
+    warn "WARP 两种协议都无法连上 Cloudflare 边缘, 已跳过写入 sing-box 出站 [${WARP_OUTBOUND_TAG}]。"
+    info "最常见原因: 机房/防火墙丢弃了到 Cloudflare 的 UDP 流量 (可查看: journalctl -u warp-svc -n 40)。"
+    info "这台机器上 WARP 无法使用, 不影响其他节点; 可在 WARP 菜单选择「卸载」清理。"
+    return 1
+  fi
+
+  if ! curl -fsS -m 8 -x "socks5h://127.0.0.1:${WARP_SOCKS_PORT}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
+    warn "WARP 显示已连接, 但经 SOCKS5 访问未检测到 warp=on, 已跳过写入出站。"
+    return 1
   fi
 
   local candidate
@@ -1826,9 +1865,9 @@ install_warp() {
   apply_candidate "$candidate"
   rm -f "$candidate"
 
-  ok "WARP 已安装并以 SOCKS5 (127.0.0.1:${WARP_SOCKS_PORT}) 接入 sing-box 出站 [${WARP_OUTBOUND_TAG}]。"
-  info "可在部署节点或编辑路由规则时, 将出站指向 '${WARP_OUTBOUND_TAG}' 以让该节点流量经由 WARP。"
-  info "提示: WARP 官方客户端不支持按 IPv4/IPv6 协议族强制锁定出口, 因此本脚本不提供该选项。"
+  ok "WARP 已连通 (warp=on), 并以 SOCKS5 (127.0.0.1:${WARP_SOCKS_PORT}) 接入 sing-box 出站 [${WARP_OUTBOUND_TAG}]。"
+  info "要让某个节点走 WARP: sb → 4 出站与穿透 → 1 Cloudflare WARP → 2 让节点走 WARP。"
+  info "提示: WARP 官方客户端不支持按 IPv4/IPv6 协议族强制锁定出口。"
 }
 
 warp_status() {
