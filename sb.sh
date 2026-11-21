@@ -96,7 +96,13 @@ ui_init() {
   UI_UTF8=0
   if [[ $loc == *utf-8* || $loc == *utf8* ]]; then UI_UTF8=1; fi
   UI_TRUECOLOR=0
-  case ${COLORTERM:-} in truecolor|24bit) UI_TRUECOLOR=1 ;; esac
+  local ct=${COLORTERM:-}
+  # sudo 会丢掉 COLORTERM: 从调用者 (sudo 进程) 的原始环境里补读
+  if [[ -z $ct && -n ${SUDO_USER:-} && -r /proc/$PPID/environ ]]; then
+    ct=$(tr '\0' '\n' </proc/$PPID/environ 2>/dev/null | sed -n 's/^COLORTERM=//p' | head -n1 || true)
+  fi
+  case $ct in truecolor|24bit) UI_TRUECOLOR=1 ;; esac
+  if [[ ${SB_TRUECOLOR:-} == 1 || ${TERM:-} == *-direct || ${TERM_PROGRAM:-} == iTerm.app || ${TERM_PROGRAM:-} == WezTerm || -n ${WT_SESSION:-} ]]; then UI_TRUECOLOR=1; fi
   UI_256=0
   if [[ ${TERM:-} == *256color* ]]; then UI_256=1; fi
   UI_LIGHT=0
@@ -3389,13 +3395,12 @@ get_cached_flag() {
 
 # ---------------------------------------------------------------------------
 # 品牌: LINONO 字样 (三档) + 徽标 (固定调色板 + 四分块字符预渲染)
-#   徽标数据: 每格 2 字符 (前景色/背景色/掩码 打包, base32) 行间以 ':' 分隔;
-#   半块后备版每格 1 字符 (上/下色, base64 字母表)。运行时不依赖任何图像工具。
+#   徽标数据: 15 色调色板 (取自原图, 不混色) + 四分块字符; 每格 2 个 base64 字符
+#   (前景色 4 位 / 背景色 4 位 / 掩码 4 位), 行间以 ':' 分隔, 约 1 KB。
+#   半块字符后备版由同一份数据在运行时折算, 不另存常量。运行时不依赖任何图像工具。
 # ---------------------------------------------------------------------------
-readonly LOGO_QB='vgvgvgvgvgvgvgvgvgvgvgvgvg3o3u3v3lvgvgvgvgvgvgvg:vgvgvgvgvgvgvgvgvg3s3s3u3v3v3n3hbobsbsbsbsbsbsvg:vgvgvgvgvgvgvgno2s2u3v3v3v467hfivgvgvgvgbibv9jbv:vgvgvgbobsbnbh3u3v3v0n0j7v7hvgvgvgvgvgjohtebfnfh:bobsbvbjvgvg3o3v0n4e7v0s0uvgvgvgjojsjujjjjjhvgvg:9n9jvgvgvg3o3v4e7v470u3jvgjojsjsjsjsjsjsjsjsjsjs:jrjvjvjsjk0j7v6763fsecfsjvjvjvijijijijijijirjjvg:vgjijjh7h7acaebvanlcejejnvnvnvnvnvnvnvnjnjvgvgvg:vgvgvgvgvgvgnjnjnrnvnvnvnvnvnnnjnhvgvgvgvgvgvgvg'
-readonly LOGO_QS='vgvgvgvgvgvgvgno3s3u3nvgvgvgvgvg:vgvgvgvgvg3o2t3v0n0rvgvgbjbjbvbt:vgbobsbi3o3v0n0j7nvgvgvgjojse3fh:bu9jvg3o0n4e473vvgvgvgjjjhvgvgvg:jijvjsgt63539kedijijijijijijjjvg:vgvgvgbjbjnrnvnvnvnnnjnjvgvgvgvg'
-readonly LOGO_HB='_____________UU0________:_________UU0000__WWWWWW_:________EE0001_v____niji:___WWi_000119f_____YYsr_:_Win___009980___YYADD___:ik____019907_YYYYYYYYYYY:DAAY_19ccYzYAAABBBBBBBD_:__DAyyyillttJJJJJJJLL___:______LLJJJJJJLLL_______'
-readonly LOGO_HS='________U07_____:_____Z0007__nniW:_WWn_0019___YYv_:ik__0180___D____:DAYYcazBBBBBBBD_:___nnJJJJJLL____'
+readonly LOGO_QB='_M_M_M_M_M_M_M_M_M_M_M_M_M_M_M_M_MbYb-8n7R_M_M_M_M_M_M_M_M_M_M:_M_M_M_M_M_M_M_M_M_M_M_M_MbYbYb_b_8n4K7R_M_M_MfYfYfYfYfY_M_M_M:_M_M_M_M_M_M_M_M_M_MbUb-b_b_8n4I4K473RjUjQfPfPfPfPfPfXf_f_d3jY:_M_M_M_M_M_M_M_M_M_Mb-b_8n4K7_7_0q3T_M_M_M_M_M_M_M_M_MjWj_j_j_:_M_M_M_M_M_M_M_M_MbW8n4K7_7_470u3_3N_M_M_M_M_M_M_M_MrYhGj_jP_M:_M_M_MfYfYf_fP_M_M7W4K7_470u3_3_3R_M_M_M_M_M_M_MDYD-qrrTrN_M_M:_Mf-f_f_fP_M_M_M7W4K470u3_3_0j0hbN_M_M_M_MXUDQDPDPDN_M_M_M_M_M:f_d3dz_M_M_M_M7U7-470u3_0n4e4BbR_MXYXYXYXYXYXYXYDYDYDYDYDYDYDY:hzr_r_rY_M_M_M0s0u3_0n4e7jTYDYD-D_D_DBX_X_WnX_PIPIOsD3D3D3Db_M:_MBJWsDzX_XYUd3z3zUeUPjIj_hBr_qtC7ysysGbH_L_L_LcLcOXP_PPPN_M_M:_M_MXOXPfIfIfIf_dndjdjkYhjtev_v_xWz_z_z_z_yIGbHPHP_M_M_M_M_M_M:_M_M_M_M_M_M_M_MnOnPnPlPtuv_v_v_v_udzTzPzP_M_M_M_M_M_M_M_M_M_M'
+readonly LOGO_QS='_M_M_M_M_M_M_M_M_M_MbUbY8r_M_M_M_M_M_M_M:_M_M_M_M_M_M_MbYb-8n4I477N_M_MfPfPf_fYjQ:_M_M_M_M_M_Mb-b_4K7_0q3N_M_M_M_M_MjWj_jT:_M_M_MfYfPfN4I7_0s0u3T_M_M_M_MDUDYrTjP_M:fUf_fP_M_M7W470u0n4ebN_M_M_MDPDP_M_M_M_M:oYr_rQ_M3U0u3_0l7j4xDYDIX_X_X_PID3DbD7DP:DOXXWuXZUd0PfIgXhTpPC3z_yBGZGYKHLdPP_M_M:_M_M_MfOfPfPnPlTtuv_udxPzPzPzP_M_M_M_M_M'
 readonly -a BANNER_BIG=(
   '██╗     @██╗@███╗   ██╗@ ██████╗ @███╗   ██╗@ ██████╗'
   '██║     @██║@████╗  ██║@██╔═══██╗@████╗  ██║@██╔═══██╗'
@@ -3415,11 +3420,10 @@ readonly -a BANNER_ASCII=(
   '| |___ | || |\  | |_| | |\  | |_| |'
   '|_____|___|_| \_|\___/|_| \_|\___/'
 )
-readonly -a LOGO_RGB=("42;123;246" "10;79;214" "242;65;42" "245;124;20" "251;191;15" "20;168;68" "7;140;58")
-readonly -a LOGO_C256=(33 26 202 208 214 35 29)
-readonly -a LOGO_C16=(94 34 91 33 93 92 32)
+readonly -a LOGO_RGB=("0;52;233" "0;116;253" "3;175;253" "252;29;16" "253;85;13" "4;155;56" "253;157;5" "3;177;60" "5;197;59" "253;213;7" "29;213;52" "73;222;48" "129;232;35" "234;236;190" "253;245;25")
+readonly -a LOGO_C256=(26 33 39 196 202 29 214 35 41 220 41 77 112 193 226)
+readonly -a LOGO_C16=(34 34 36 31 91 32 33 32 32 33 32 92 33 37 33)
 readonly -a LOGO_QCH=(" " "▘" "▝" "▀" "▖" "▌" "▞" "▛" "▗" "▚" "▐" "▜" "▄" "▙" "▟" "█")
-readonly LOGO_A32="0123456789abcdefghijklmnopqrstuv"
 readonly LOGO_A64="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
 
 # 把一行 '@' 分段的字样按字母着色输出 (无颜色时 UI_LC 为空串, 自然降级)
@@ -3464,46 +3468,39 @@ ui_banner() {
 # 把徽标解码到 UI_LOGO_ROWS (每行已含转义码) 与 UI_LOGO_W; 不满足降级条件返回 1
 UI_LOGO_ROWS=(); UI_LOGO_W=0
 ui_logo_build() {
-  local size=$1 mode=quad data row i n t cell hi lo v fg bg m top bot ch seq fgc bgc
+  local size=$1 mode=quad data row i n t hi lo v fg bg m seq out top bot ul ur ll lr ch
+  local -a rows=()
   UI_LOGO_ROWS=(); UI_LOGO_W=0
   (( UI_COLOR && UI_UTF8 )) || return 1
   # 四分块字符在个别旧终端 (Linux 控制台 / vt 系列) 有细缝: 退回半块字符版
   if [[ ${SB_LOGO_HALF:-0} == 1 || ${TERM:-} == linux || ${TERM:-} == vt* ]]; then mode=half; fi
-  case $mode:$size in
-    quad:big) data=$LOGO_QB ;; quad:small) data=$LOGO_QS ;;
-    half:big) data=$LOGO_HB ;; *) data=$LOGO_HS ;;
-  esac
-  local -a rows=()
+  if [[ $size == big ]]; then data=$LOGO_QB; else data=$LOGO_QS; fi
   IFS=':' read -ra rows <<<"$data"
   for row in "${rows[@]}"; do
-    local out=""
-    if [[ $mode == quad ]]; then
-      n=${#row}
-      for ((i=0; i<n; i+=2)); do
-        t=${LOGO_A32%%"${row:i:1}"*}; hi=${#t}
-        t=${LOGO_A32%%"${row:i+1:1}"*}; lo=${#t}
-        v=$(( hi*32 + lo )); fg=$(( (v>>7)&7 )); bg=$(( (v>>4)&7 )); m=$(( v&15 ))
-        if (( fg == 7 || m == 0 )); then out+=" "; continue; fi
-        ui_logo_code fg "$fg"; fgc=$UI_LCODE
-        seq=$'\033['"$fgc"
-        if (( bg != 7 )); then ui_logo_code bg "$bg"; seq+=";$UI_LCODE"; fi
+    out=""; n=${#row}
+    for ((i=0; i<n; i+=2)); do
+      t=${LOGO_A64%%"${row:i:1}"*}; hi=${#t}
+      t=${LOGO_A64%%"${row:i+1:1}"*}; lo=${#t}
+      v=$(( hi*64 + lo )); fg=$(( (v>>8)&15 )); bg=$(( (v>>4)&15 )); m=$(( v&15 ))
+      if (( fg == 15 || m == 0 )); then out+=" "; continue; fi
+      if [[ $mode == quad ]]; then
+        ui_logo_code fg "$fg"; seq=$'\033['"$UI_LCODE"
+        if (( bg != 15 )); then ui_logo_code bg "$bg"; seq+=";$UI_LCODE"; fi
         out+="${seq}m${LOGO_QCH[m]}"$'\033[0m'
-      done
-      UI_LOGO_W=$(( n/2 ))
-    else
-      n=${#row}
-      for ((i=0; i<n; i++)); do
-        t=${LOGO_A64%%"${row:i:1}"*}; v=${#t}
-        top=$(( (v>>3)&7 )); bot=$(( v&7 ))
-        if (( top == 7 && bot == 7 )); then out+=" "; continue; fi
-        if (( top == 7 )); then ch="▄"; ui_logo_code fg "$bot"; seq=$'\033['"$UI_LCODE"
-        elif (( bot == 7 )); then ch="▀"; ui_logo_code fg "$top"; seq=$'\033['"$UI_LCODE"
+      else
+        # 由四分块数据折算半块: 上半取左上/右上, 下半取左下/右下 (优先取有色的一侧)
+        ul=$(( (m&1) ? fg : bg )); ur=$(( (m&2) ? fg : bg )); ll=$(( (m&4) ? fg : bg )); lr=$(( (m&8) ? fg : bg ))
+        top=$ul; if (( top == 15 )); then top=$ur; fi
+        bot=$ll; if (( bot == 15 )); then bot=$lr; fi
+        if (( top == 15 && bot == 15 )); then out+=" "; continue; fi
+        if (( top == 15 )); then ch="▄"; ui_logo_code fg "$bot"; seq=$'\033['"$UI_LCODE"
+        elif (( bot == 15 )); then ch="▀"; ui_logo_code fg "$top"; seq=$'\033['"$UI_LCODE"
         elif (( top == bot )); then ch="█"; ui_logo_code fg "$top"; seq=$'\033['"$UI_LCODE"
         else ch="▀"; ui_logo_code fg "$top"; seq=$'\033['"$UI_LCODE"; ui_logo_code bg "$bot"; seq+=";$UI_LCODE"; fi
         out+="${seq}m${ch}"$'\033[0m'
-      done
-      UI_LOGO_W=$n
-    fi
+      fi
+    done
+    UI_LOGO_W=$(( n/2 ))
     UI_LOGO_ROWS+=("$out")
   done
   return 0
@@ -3597,14 +3594,14 @@ ui_status_line() {
 
 # 启动画面 (进入交互菜单的第一次显示): 左徽标, 右紧凑字样 + 版本 + 状态 + 地址
 ui_splash() {
-  local cols size sub i n
-  local -a right=() comp=()
+  local cols size sub i n j pad rw
+  local -a right=() comp=() base=()
   cols=$(ui_cols)
   ui_status_collect; ui_status_text; ui_addr_text
-  size=big; if (( cols < 60 )); then size=small; fi
+  size=""; if (( cols >= 64 )); then size=big; elif (( cols >= 40 )); then size=small; fi
   sub="singbox VPS 双栈智能管理 v${SCRIPT_VERSION}"
   if (( cols < 50 )); then sub="singbox VPS v${SCRIPT_VERSION}"; fi
-  if (( cols >= 36 )) && { ui_logo_image || ui_logo_build "$size"; }; then
+  if [[ -n $size ]] && { ui_logo_image || ui_logo_build "$size"; }; then
     if (( ${#UI_LOGO_ROWS[@]} == 0 )); then   # 已显示原图: 文字放在图下方
       ui_banner "$cols"
       printf ' %s%s%s\n' "$BOLD" "$sub" "$NC"
@@ -3612,22 +3609,25 @@ ui_splash() {
       printf ' %s\n %s\n\n' "$UI_A4" "$UI_A6"
       return 0
     fi
-    if (( cols - UI_LOGO_W - 2 >= 26 )); then
+    rw=$(( cols - UI_LOGO_W - 2 ))
+    if (( rw >= 26 )); then
       comp[0]=$(ui_brand_line "${BANNER_COMP[0]}"); comp[1]=$(ui_brand_line "${BANNER_COMP[1]}")
     else   # 右侧放不下紧凑字样: 退为一行 LINONO
       comp[0]=$(ui_brand); comp[1]=""
     fi
     n=${#UI_LOGO_ROWS[@]}
+    local st="${UI_ST_COL}${UI_ST_DOT}${NC} ${UI_ST_TXT}  节点 ${BOLD}${UI_ST_NODES}${NC}"
     if (( n >= 9 )); then
-      right=("" "${comp[0]}" "${comp[1]}" "" "${BOLD}${sub}${NC}" "" \
-        "${UI_ST_COL}${UI_ST_DOT}${NC} ${UI_ST_TXT}  节点 ${BOLD}${UI_ST_NODES}${NC}" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}")
+      base=("" "${comp[0]}" "${comp[1]}" "" "${BOLD}${sub}${NC}" "" "$st" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}")
     else
-      right=("${comp[0]}" "${comp[1]}" "${BOLD}${sub}${NC}" \
-        "${UI_ST_COL}${UI_ST_DOT}${NC} ${UI_ST_TXT}  节点 ${BOLD}${UI_ST_NODES}${NC}" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}")
+      base=("${comp[0]}" "${comp[1]}" "${BOLD}${sub}${NC}" "$st" "${DIM}v4${NC}${UI_A4#v4}" "${DIM}v6${NC}${UI_A6#v6}")
     fi
+    pad=$(( (n - ${#base[@]}) / 2 )); if (( pad < 0 )); then pad=0; fi
     printf '\n'
     for ((i=0; i<n; i++)); do
-      printf '%s  %s\n' "${UI_LOGO_ROWS[i]}" "${right[i]:-}"
+      j=$(( i - pad ))
+      if (( j >= 0 && j < ${#base[@]} )); then right[i]=${base[j]}; else right[i]=""; fi
+      printf '%s  %s\n' "${UI_LOGO_ROWS[i]}" "${right[i]}"
     done
     printf '\n'
     return 0
@@ -3799,10 +3799,10 @@ ui_exec_row() {
 # 渲染
 # ---------------------------------------------------------------------------
 ui_main_draw() {
-  local cols row kind grp num sect title desc func cli flags
+  local skip=${1:-0} cols row kind grp num sect title desc func cli flags
   cols=$(ui_cols)
   printf '\n'
-  ui_status_line
+  if (( skip == 0 )); then ui_status_line; fi   # 首屏启动画面已含状态, 不重复
   ui_hr
   for row in "${SB_MENU[@]}"; do
     IFS='|' read -r kind grp num sect title desc func cli flags <<<"$row"
@@ -3872,12 +3872,12 @@ ui_group_menu() {
 }
 
 menu() {
-  local choice rc
+  local choice rc first=1
   MENU_INT=0; INT_COUNT=0
   trap "$UI_INT_TRAP" INT
   ui_splash
   while true; do
-    ui_main_draw
+    ui_main_draw "$first"; first=0
     rc=0; MENU_INT=0; MENU_LVL=main
     read -e -r -p "选择 [0-6]: " choice || rc=$?
     MENU_LVL=sub
