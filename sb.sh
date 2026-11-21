@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
-# Repository : https://github.com/lisiyong0707/singbox
+# Repository : https://github.com/lino-no/singbox
 #
 # 功能总览:
 #   VLESS Reality / Reality gRPC / ShadowTLS v3+SS2022 / Shadowsocks 2022 /
@@ -61,7 +61,7 @@ readonly SUB_HTTPD_UNIT="/etc/systemd/system/sing-box-vps-sub.service"
 readonly LOCK_FILE="/run/sing-box-vps.lock"
 readonly LOGROTATE_FILE="/etc/logrotate.d/sing-box-vps"
 
-SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lisiyong0707/singbox/main/sb.sh}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh}"
 
 readonly REALITY_PRESET_DOMAINS=(
   "gateway.icloud.com"
