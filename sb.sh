@@ -3908,6 +3908,20 @@ usage() {
   return 0
 }
 
+# 快捷命令自愈: 只要脚本是以文件方式运行 (非 curl|bash), 就保证 sb 命令存在且不比当前版本旧。
+# (旧版只在首次安装 sing-box 时创建 sb, 已装过 sing-box 的机器直接运行新脚本不会生成)
+ensure_shortcut() {
+  local src=${BASH_SOURCE[0]:-} cur="" real
+  [[ -n $src && -r $src && $src != /dev/* && $src != /proc/* ]] || return 0
+  real=$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")
+  [[ $real != "$MANAGER_PATH" ]] || return 0
+  if [[ -f $MANAGER_PATH ]]; then
+    cur=$(sed -n 's/^readonly SCRIPT_VERSION="\(.*\)"$/\1/p' "$MANAGER_PATH" 2>/dev/null | head -n1 || true)
+  fi
+  if [[ -x $SHORTCUT_PATH && -n $cur ]] && version_ge "$cur" "$SCRIPT_VERSION"; then return 0; fi
+  install_manager
+}
+
 main() {
   local cmd=${1:-menu}
   case $cmd in
@@ -3916,6 +3930,7 @@ main() {
   esac
   require_root
   ensure_dirs
+  ensure_shortcut
   R_FUNC=""; R_FLAGS=""
   if [[ $cmd != menu ]]; then
     ui_cli_row "$cmd" || { usage; exit 1; }
