@@ -1791,7 +1791,8 @@ install_warp_client() {
   install -m 644 "$tmp" "$keyring"      # 关键: 必须 644, apt 的 _apt 用户要能读
   rm -f "$tmp"
 
-  codename=$(lsb_release -cs 2>/dev/null || . /etc/os-release && printf '%s' "${VERSION_CODENAME:-jammy}")
+  codename=$(lsb_release -cs 2>/dev/null || true)
+[[ -n $codename ]] || codename=$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-noble}")
   if ! curl -fsI "https://pkg.cloudflareclient.com/dists/${codename}/InRelease" >/dev/null 2>&1; then
     warn "WARP 源暂无 ${codename} 的 dist, 回退使用 noble"
     codename=noble
@@ -1802,11 +1803,21 @@ EOF
   ui_run "安装 WARP 客户端 (apt)" _apt_update_install cloudflare-warp
 }
 
+warp_ensure_registered() {
+  systemctl enable --now warp-svc >/dev/null 2>&1 || true
+  sleep 2
+  if ! warp-cli --accept-tos registration show >/dev/null 2>&1; then
+    warp-cli --accept-tos registration new >/dev/null 2>&1 \
+      || warp-cli --accept-tos register >/dev/null 2>&1 || true
+  fi
+}
+
+
 warp_connect() {
   # WARP 本身只有"是否连接"的开关, 没有按协议族区分的模式,
   # 这里固定用 proxy 模式在本机暴露 SOCKS5, 不再提供虚假的 v4/v6/dual 选择
-  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
-  warp-cli --accept-tos proxy port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || true
+  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli --accept-tos set-mode proxy >/dev/null 2>&1 || true
+  warp-cli --accept-tos proxy port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || warp-cli --accept-tos set-proxy-port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || true
   warp-cli --accept-tos connect >/dev/null 2>&1 || true
 }
 
