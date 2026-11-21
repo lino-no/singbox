@@ -1779,22 +1779,27 @@ install_warp_client() {
   require_apt
   info "配置 Cloudflare WARP 官方 APT 源"
   install -d -m 755 /usr/share/keyrings
-  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-  local codename
-  codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
-  tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null <<EOF
-deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
-EOF
-  apt-get update -qq
-  apt-get install -y -qq cloudflare-warp
-}
+  local keyring=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg tmp codename
+  tmp=$(mktemp)
+  : > "$tmp"
+  # 旧密钥 (ASCII armor -> 二进制) + 新密钥, 拼成一个 keyring (二进制 keyring 可直接拼接)
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor >> "$tmp" \
+    || warn "下载 WARP 旧密钥失败"
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg >> "$tmp" \
+    || warn "下载 Cloudflare v2 密钥失败"
+  [[ -s $tmp ]] || die "未能获取任何 Cloudflare 签名密钥。"
+  install -m 644 "$tmp" "$keyring"      # 关键: 必须 644, apt 的 _apt 用户要能读
+  rm -f "$tmp"
 
-warp_ensure_registered() {
-  systemctl enable --now warp-svc >/dev/null 2>&1 || true
-  sleep 2
-  if ! warp-cli --accept-tos status >/dev/null 2>&1; then
-    warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+  codename=$(lsb_release -cs 2>/dev/null || . /etc/os-release && printf '%s' "${VERSION_CODENAME:-jammy}")
+  if ! curl -fsI "https://pkg.cloudflareclient.com/dists/${codename}/InRelease" >/dev/null 2>&1; then
+    warn "WARP 源暂无 ${codename} 的 dist, 回退使用 noble"
+    codename=noble
   fi
+  tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null <<EOF
+deb [signed-by=${keyring}] https://pkg.cloudflareclient.com/ ${codename} main
+EOF
+  ui_run "安装 WARP 客户端 (apt)" _apt_update_install cloudflare-warp
 }
 
 warp_connect() {
