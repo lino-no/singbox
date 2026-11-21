@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
-# Repository : https://github.com/lino-no/singbox
+# Repository : https://github.com/lisiyong0707/singbox
 #
 # 功能总览:
 #   VLESS Reality / Reality gRPC / ShadowTLS v3+SS2022 / Shadowsocks 2022 /
@@ -61,7 +61,7 @@ readonly SUB_HTTPD_UNIT="/etc/systemd/system/sing-box-vps-sub.service"
 readonly LOCK_FILE="/run/sing-box-vps.lock"
 readonly LOGROTATE_FILE="/etc/logrotate.d/sing-box-vps"
 
-SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lisiyong0707/singbox/main/sb.sh}"
 
 readonly REALITY_PRESET_DOMAINS=(
   "gateway.icloud.com"
@@ -3102,7 +3102,15 @@ purge_all() {
 UI_WV=0
 # 计算显示宽度 (全角/宽字符/emoji 记 2 列), 结果写入 UI_WV, 避免子进程开销
 ui_wv() {
-  local s=$1 i ch cp w=0 n=${#1}
+  local s=$1 i ch cp w=0 n=${#1} hi=0
+  if (( ! UI_UTF8 )); then
+    # 非 UTF-8 locale 下 bash 按字节计数: 高位字节每 3 个约折合 1 个全角字符 (2 列)
+    for ((i=0; i<n; i++)); do
+      ch=${s:i:1}; printf -v cp '%d' "'$ch" 2>/dev/null || cp=0
+      if (( cp >= 128 || cp < 0 )); then hi=$((hi+1)); else w=$((w+1)); fi
+    done
+    UI_WV=$(( w + hi * 2 / 3 )); return 0
+  fi
   for ((i=0; i<n; i++)); do
     ch=${s:i:1}
     printf -v cp '%d' "'$ch" 2>/dev/null || cp=0
@@ -3190,9 +3198,9 @@ ui_run() {
   tmp=$(mktemp)
   t0=$(ui_now_us)
   if [[ -n $cap ]]; then
-    ( UI_IN_RUN=1; "$@" ) >"$cap" 2>"$tmp" </dev/null &
+    ( UI_IN_RUN=1; trap - ERR; "$@" ) >"$cap" 2>"$tmp" </dev/null &
   else
-    ( UI_IN_RUN=1; "$@" ) >"$tmp" 2>&1 </dev/null &
+    ( UI_IN_RUN=1; trap - ERR; "$@" ) >"$tmp" 2>&1 </dev/null &
   fi
   pid=$!; UI_BG_PID=$pid
   if (( istty )); then
@@ -4014,7 +4022,7 @@ ui_node_table() {
   printf '
 '
   if (( narrow )); then
-    printf '%s%s%s%s%s墙 听%s\n' "$BOLD" "$(ui_pad ' #' 4)" "$(ui_pad '状态' 5)" "$(ui_pad '协议' 13)" "$(ui_pad '端口' 13)" "$NC"
+    printf '%s%s%s%s%s%s听%s\n' "$BOLD" "$(ui_pad ' #' 4)" "$(ui_pad '状态' 5)" "$(ui_pad '协议' 13)" "$(ui_pad '端口' 13)" "$(ui_pad '墙' 5)" "$NC"
   else
     printf '%s%s%s%s%s%s%s名称%s\n' "$BOLD" "$(ui_pad ' #' 4)" "$(ui_pad '状态' 6)" "$(ui_pad '协议' 13)" "$(ui_pad '端口/传输' 13)" "$(ui_pad '防火墙' 8)" "$(ui_pad '监听' 6)" "$NC"
   fi
@@ -4037,15 +4045,15 @@ ui_node_table() {
       tp="${port}/${tp}"
     fi
     inb_ok=0; [[ -n ${INB_PORT[$tag]+x} ]] && inb_ok=1
-    if (( active && inb_ok )); then st="${GREEN}${G_DOT}${NC}"; else st="${RED}${G_OFF}${NC}"; fi
-    case $fw in 1) fwc="${GREEN}${G_OK}${NC}" ;; 0) fwc="${RED}${G_X}${NC}" ;; *) fwc="${DIM}${G_SKIP}${NC}" ;; esac
+    if (( active && inb_ok )); then st="${GREEN}$(ui_pad "$G_DOT" $(( narrow ? 5 : 6 )))${NC}"; else st="${RED}$(ui_pad "$G_OFF" $(( narrow ? 5 : 6 )))${NC}"; fi
+    case $fw in 1) fwc="${GREEN}$(ui_pad "$G_OK" $(( narrow ? 5 : 8 )))${NC}" ;; 0) fwc="${RED}$(ui_pad "$G_X" $(( narrow ? 5 : 8 )))${NC}" ;; *) fwc="${DIM}$(ui_pad "$G_SKIP" $(( narrow ? 5 : 8 )))${NC}" ;; esac
     case $ls in 1) lsc="${GREEN}${G_OK}${NC}" ;; 0) lsc="${RED}${G_X}${NC}" ;; *) lsc="${DIM}${G_SKIP}${NC}" ;; esac
     if (( narrow )); then
-      printf ' %s%-2d%s %s    %-12s %-12s %s %s\n' "$CYAN" $((i+1)) "$NC" "$st" "$(ui_trunc "$label" 12)" "$(ui_trunc "$tp" 12)" "$fwc" "$lsc"
+      printf ' %s%-2d%s %s%-12s %-12s %s%s\n' "$CYAN" $((i+1)) "$NC" "$st" "$(ui_trunc "$label" 12)" "$(ui_trunc "$tp" 12)" "$fwc" "$lsc"
     else
       room=$(( cols - 52 )); if (( room < 8 )); then room=8; fi
       name=$(ui_trunc "$(ui_uri_name "${NL_URI[i]}")" "$room")
-      printf ' %s%-2d%s %s     %-12s %-12s %s       %s     %s\n' "$CYAN" $((i+1)) "$NC" "$st" "$label" "$tp" "$fwc" "$lsc" "$name"
+      printf ' %s%-2d%s %s%-12s %-12s %s%s%s%s\n' "$CYAN" $((i+1)) "$NC" "$st" "$label" "$tp" "$fwc" "$lsc" "$(ui_pad '' 5)" "$name"
     fi
     if (( fw == 0 )); then hints+=("$(printf '%s%s%s %d 防火墙未放行 %s  %s→%s %sf%d%s 修复防火墙' "$YELLOW" "$G_WARN" "$NC" $((i+1)) "$tp" "$DIM" "$NC" "$CYAN" $((i+1)) "$NC")"); fi
     if (( ls == 0 )); then hints+=("$(printf '%s%s%s %d 未监听 %s  %s→%s %sl%d%s 查看日志' "$YELLOW" "$G_WARN" "$NC" $((i+1)) "$tp" "$DIM" "$NC" "$CYAN" $((i+1)) "$NC")"); fi
@@ -4209,15 +4217,15 @@ deploy_quick_reality() {
 
   while true; do
     printf '\n%s%s%s\n' "$BOLD" "部署摘要" "$NC"
-    case $mode in dual) printf '  %-9s Dual 双栈 (v4 + v6)\n' "模式" ;; v4) printf '  %-9s 仅 IPv4\n' "模式" ;; *) printf '  %-9s 仅 IPv6 (严格)\n' "模式" ;; esac
+    case $mode in dual) printf '  %s Dual 双栈 (v4 + v6)\n' "$(ui_pad 模式 9)" ;; v4) printf '  %s 仅 IPv4\n' "$(ui_pad 模式 9)" ;; *) printf '  %s 仅 IPv6 (严格)\n' "$(ui_pad 模式 9)" ;; esac
     if [[ $port != "$want" ]]; then
-      printf '  %-9s %s%s%s  %s%s %s 已被占用, 自动顺延%s\n' "端口" "$BOLD" "$port" "$NC" "$YELLOW" "$G_WARN" "$want" "$NC"
+      printf '  %s %s%s%s  %s%s %s 已被占用, 自动顺延%s\n' "$(ui_pad 端口 9)" "$BOLD" "$port" "$NC" "$YELLOW" "$G_WARN" "$want" "$NC"
     else
-      printf '  %-9s %s%s%s\n' "端口" "$BOLD" "$port" "$NC"
+      printf '  %s %s%s%s\n' "$(ui_pad 端口 9)" "$BOLD" "$port" "$NC"
     fi
-    printf '  %-9s %s  %s\n' "握手域名" "$handshake" "$tls13"
-    printf '  %-9s %s\n' "连接地址" "${host:-<未检测到, 请按 e 填写>}"
-    printf '  %-9s %s\n' "节点名" "$name"
+    printf '  %s %s  %s\n' "$(ui_pad 握手域名 9)" "$handshake" "$tls13"
+    printf '  %s %s\n' "$(ui_pad 连接地址 9)" "${host:-<未检测到, 请按 e 填写>}"
+    printf '  %s %s\n' "$(ui_pad 节点名 9)" "$name"
     read -e -r -p "回车 确认 / e 逐项修改 / 0 取消: " ans || die "输入已取消。"
     case ${ans//[[:space:]]/} in
       '') if [[ -z $host ]]; then warn "连接地址为空, 请先按 e 填写。"; continue; fi; break ;;
@@ -4515,4 +4523,3 @@ show_status() {
 
 # 测试 / 以 source 方式引用时设置 SB_SOURCE_ONLY=1 只加载函数而不执行 main
 if [[ -z ${SB_SOURCE_ONLY:-} ]]; then main "$@"; fi
-
