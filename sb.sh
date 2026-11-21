@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
-# Repository : https://github.com/lino-no/singbox
+# Repository : https://github.com/lisiyong0707/singbox
 #
 # 功能总览:
 #   VLESS Reality / Reality gRPC / ShadowTLS v3+SS2022 / Shadowsocks 2022 /
@@ -61,7 +61,7 @@ readonly SUB_HTTPD_UNIT="/etc/systemd/system/sing-box-vps-sub.service"
 readonly LOCK_FILE="/run/sing-box-vps.lock"
 readonly LOGROTATE_FILE="/etc/logrotate.d/sing-box-vps"
 
-SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lino-no/singbox/main/sb.sh}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/lisiyong0707/singbox/main/sb.sh}"
 
 readonly REALITY_PRESET_DOMAINS=(
   "gateway.icloud.com"
@@ -1779,81 +1779,41 @@ install_warp_client() {
   require_apt
   info "配置 Cloudflare WARP 官方 APT 源"
   install -d -m 755 /usr/share/keyrings
-  local keyring=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg tmp c codename=""
-  tmp=$(mktemp)
-  # 旧密钥 (ASCII armor) 需 dearmor; v2 密钥已是二进制, 直接拼接
-  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor >> "$tmp" 2>/dev/null \
-    || warn "下载 WARP 旧密钥失败"
-  curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg >> "$tmp" 2>/dev/null \
-    || warn "下载 Cloudflare v2 密钥失败"
-  [[ -s $tmp ]] || { rm -f "$tmp"; die "未能获取任何 Cloudflare 签名密钥。"; }
-  install -m 644 "$tmp" "$keyring"    # 必须 644: apt 的 _apt 用户要能读 (脚本 umask 077)
-  rm -f "$tmp"
-
-  local sys_codename
-  sys_codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
-  for c in "$sys_codename" noble jammy; do
-    [[ -n $c ]] || continue
-    if curl -fsI --max-time 8 "https://pkg.cloudflareclient.com/dists/${c}/InRelease" >/dev/null 2>&1; then
-      codename=$c; break
-    fi
-  done
-  [[ -n $codename ]] || die "WARP 官方源没有可用的 dist (已尝试 ${sys_codename:-?}/noble/jammy)。"
-  [[ $codename == "$sys_codename" ]] || warn "WARP 源暂无 ${sys_codename:-当前系统} 的 dist, 回退使用 ${codename}"
-
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+  local codename
+  codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
   tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null <<EOF
-deb [signed-by=${keyring}] https://pkg.cloudflareclient.com/ ${codename} main
+deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main
 EOF
-  _apt_update_install cloudflare-warp
-}
-
-warp_is_connected() {
-  warp-cli --accept-tos status 2>/dev/null | grep -qE 'Status update:[[:space:]]*Connected'
+  apt-get update -qq
+  apt-get install -y -qq cloudflare-warp
 }
 
 warp_ensure_registered() {
   systemctl enable --now warp-svc >/dev/null 2>&1 || true
   sleep 2
-  if ! warp-cli --accept-tos registration show >/dev/null 2>&1; then
-    warp-cli --accept-tos registration new >/dev/null 2>&1 \
-      || warp-cli --accept-tos register >/dev/null 2>&1 || true
+  if ! warp-cli --accept-tos status >/dev/null 2>&1; then
+    warp-cli --accept-tos registration new >/dev/null 2>&1 || true
   fi
 }
 
-# 依次尝试 MASQUE 与 WireGuard, 每种协议最多等 20 秒; 成功返回 0
 warp_connect() {
-  local proto i
-  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli --accept-tos set-mode proxy >/dev/null 2>&1 || true
-  warp-cli --accept-tos proxy port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || warp-cli --accept-tos set-proxy-port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || true
-  for proto in MASQUE WireGuard; do
-    warp-cli --accept-tos tunnel protocol set "$proto" >/dev/null 2>&1 || true
-    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-    sleep 1
-    warp-cli --accept-tos connect >/dev/null 2>&1 || true
-    for i in 1 2 3 4 5 6 7; do
-      sleep 3
-      if warp_is_connected; then info "WARP 已通过 ${proto} 协议连接。"; return 0; fi
-    done
-    warn "WARP 使用 ${proto} 协议 20 秒内未能连接。"
-  done
-  return 1
+  # WARP 本身只有"是否连接"的开关, 没有按协议族区分的模式,
+  # 这里固定用 proxy 模式在本机暴露 SOCKS5, 不再提供虚假的 v4/v6/dual 选择
+  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
+  warp-cli --accept-tos proxy port "$WARP_SOCKS_PORT" >/dev/null 2>&1 || true
+  warp-cli --accept-tos connect >/dev/null 2>&1 || true
 }
 
 install_warp() {
   ensure_installed
   command -v warp-cli >/dev/null 2>&1 || install_warp_client
   warp_ensure_registered
+  warp_connect
+  sleep 2
 
-  if ! warp_connect; then
-    warn "WARP 两种协议都无法连上 Cloudflare 边缘, 已跳过写入 sing-box 出站 [${WARP_OUTBOUND_TAG}]。"
-    info "最常见原因: 机房/防火墙丢弃了到 Cloudflare 的 UDP 流量 (可查看: journalctl -u warp-svc -n 40)。"
-    info "这台机器上 WARP 无法使用, 不影响其他节点; 可在 WARP 菜单选择「卸载」清理。"
-    return 1
-  fi
-
-  if ! curl -fsS -m 8 -x "socks5h://127.0.0.1:${WARP_SOCKS_PORT}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
-    warn "WARP 显示已连接, 但经 SOCKS5 访问未检测到 warp=on, 已跳过写入出站。"
-    return 1
+  if ! warp-cli --accept-tos status 2>/dev/null | grep -qi "Connected"; then
+    warn "WARP 客户端未能确认 Connected 状态, 请稍后使用 'sb' 菜单中的 WARP 状态查看。"
   fi
 
   local candidate
@@ -1866,9 +1826,9 @@ install_warp() {
   apply_candidate "$candidate"
   rm -f "$candidate"
 
-  ok "WARP 已连通 (warp=on), 并以 SOCKS5 (127.0.0.1:${WARP_SOCKS_PORT}) 接入 sing-box 出站 [${WARP_OUTBOUND_TAG}]。"
-  info "要让某个节点走 WARP, 需把它的路由规则出站改为 '${WARP_OUTBOUND_TAG}'。"
-  info "提示: WARP 官方客户端不支持按 IPv4/IPv6 协议族强制锁定出口。"
+  ok "WARP 已安装并以 SOCKS5 (127.0.0.1:${WARP_SOCKS_PORT}) 接入 sing-box 出站 [${WARP_OUTBOUND_TAG}]。"
+  info "可在部署节点或编辑路由规则时, 将出站指向 '${WARP_OUTBOUND_TAG}' 以让该节点流量经由 WARP。"
+  info "提示: WARP 官方客户端不支持按 IPv4/IPv6 协议族强制锁定出口, 因此本脚本不提供该选项。"
 }
 
 warp_status() {
@@ -1876,17 +1836,37 @@ warp_status() {
     warn "WARP 客户端尚未安装。"
     return 0
   fi
+  local ip tag out
   warp-cli --accept-tos status || true
+  ip=$(warp_egress_ip || true)
+  if [[ -n $ip ]]; then printf '\nWARP 出口 IP: %s\n' "$ip"; else printf '\nWARP 出口 IP: 未能获取 (SOCKS5 127.0.0.1:%s 不通)\n' "$WARP_SOCKS_PORT"; fi
   printf '\nsing-box 内 WARP 出站配置:\n'
   jq -r --arg tag "$WARP_OUTBOUND_TAG" '.outbounds[]? | select(.tag==$tag)' "$CONFIG_FILE" 2>/dev/null || true
+  printf '\n各节点出站绑定:\n'
+  while IFS= read -r tag; do
+    [[ -n $tag ]] || continue
+    out=$(node_current_outbound "$tag")
+    if [[ $out == "$WARP_OUTBOUND_TAG" ]]; then printf '  %s -> %s%s%s\n' "$tag" "$GREEN" "$out" "$NC"; else printf '  %s -> %s\n' "$tag" "$out"; fi
+  done < <(jq -r '.connections[]?.tag' "$STATE_FILE" 2>/dev/null)
 }
 
 uninstall_warp() {
   confirm "确认卸载 WARP 客户端并移除其 sing-box 出站" N || return 0
+  local tag back type candidate
+  # 先把仍绑定 warp-out 的节点恢复直连, 否则删掉出站后路由规则会指向不存在的出站, sing-box 无法启动
+  while IFS= read -r tag; do
+    [[ -n $tag ]] || continue
+    type=$(_conn_field "$tag" type 2>/dev/null || true)
+    back=$(default_outbound_for_type "$type")
+    route_set_outbound "$tag" "$back"
+    info "节点 [${tag}] 已恢复为 ${back}。"
+  done < <(jq -r --arg w "$WARP_OUTBOUND_TAG" '.route.rules[]? | select(.outbound == $w) | (.inbound // [])[]' "$CONFIG_FILE" 2>/dev/null)
   systemctl disable --now warp-svc 2>/dev/null || true
   apt-get remove -y -qq cloudflare-warp 2>/dev/null || true
-  atomic_json_update "$CONFIG_FILE" '.outbounds |= map(select(.tag != $tag))' --arg tag "$WARP_OUTBOUND_TAG" || true
-  systemctl restart sing-box 2>/dev/null || true
+  candidate=$(mktemp)
+  jq --arg tag "$WARP_OUTBOUND_TAG" '.outbounds |= map(select(.tag != $tag))' "$CONFIG_FILE" > "$candidate"
+  apply_candidate "$candidate"
+  rm -f "$candidate"
   ok "WARP 已卸载。"
 }
 
@@ -3649,8 +3629,10 @@ readonly -a SB_MENU=(
   "I|3|5|安全|查看 / 重置 token|重置后旧链接立即失效|sub_token_manage|-|"
   "I|3|6|安全|删除全部订阅文件||sub_delete_all|-|D"
   "I|7|1||安装并连接|作为出站 outbound|install_warp|-|"
-  "I|7|2||查看状态||warp_status|-|P"
-  "I|7|3||卸载||uninstall_warp|-|D"
+  "I|7|2||让节点走 WARP|选择节点, 其出站改为 WARP|warp_assign_node|-|"
+  "I|7|3||恢复节点直连|撤销 WARP 绑定|warp_restore_node|-|"
+  "I|7|4||查看状态|连接状态 / 出口 IP / 节点绑定|warp_status|-|P"
+  "I|7|5||卸载||uninstall_warp|-|D"
   "I|8|1||新建 Tunnel + VLESS WS 节点||deploy_cloudflare_tunnel|-|"
   "I|8|2|运行|查看状态||cf_tunnel_status|-|P"
   "I|8|3|运行|查看日志||cf_tunnel_logs|-|P"
@@ -4465,7 +4447,7 @@ health_check() {
     if systemctl is-active --quiet cloudflared 2>/dev/null; then dg ok "cloudflared 状态" "运行中"; else dg fail "cloudflared 状态" "未运行"; fi
   fi
   if command -v warp-cli >/dev/null 2>&1; then
-    if warp-cli --accept-tos status 2>/dev/null | grep -qE 'Status update:[[:space:]]*Connected'; then dg ok "WARP 状态" "已连接"; else dg fail "WARP 状态" "未连接"; fi
+    if warp-cli --accept-tos status 2>/dev/null | grep -qi Connected; then dg ok "WARP 状态" "已连接"; else dg fail "WARP 状态" "未连接"; fi
   fi
   printf '\n出站规则列表:\n'
   jq -r '.outbounds[]? | "- \(.tag) [\(.type)] domain_resolver 策略: \(.domain_resolver.strategy // "默认")"' "$CONFIG_FILE"
@@ -4629,6 +4611,92 @@ ui_os_gate() {
   printf '  已退出, %s未做任何修改%s。\n' "$BOLD" "$NC"
   printf '  %s如确认环境兼容, 可设置 SB_SKIP_OS_CHECK=1 强制继续 (不保证可用)。%s\n\n' "$DIM" "$NC"
   exit 1
+}
+
+
+# ===========================================================================
+# WARP 出站绑定: 安装 WARP 只是多了一个 warp-out 出站, 节点默认仍走 direct-*。
+# 这里提供「让节点走 WARP / 恢复直连」, 通过改写该节点的路由规则实现 (走 apply_candidate:
+# 校验 + 备份 + 失败自动回滚)。
+# 说明: 改变的是「目标网站看到的出口 IP」; 客户端连接用的仍是 VPS 自己的 IP。
+# ===========================================================================
+# 把某个入站 tag 的路由规则出站改为 <outbound>; 没有规则则新增一条
+route_set_outbound() {   # route_set_outbound <入站 tag> <出站 tag>
+  local candidate
+  candidate=$(mktemp)
+  jq --arg t "$1" --arg o "$2" '
+    .route.rules = (.route.rules // []) |
+    if (.route.rules | any((.inbound // []) | index($t))) then
+      .route.rules |= map(if ((.inbound // []) | index($t)) then .outbound = $o else . end)
+    else
+      .route.rules += [{inbound:[$t], action:"route", outbound:$o}]
+    end
+  ' "$CONFIG_FILE" > "$candidate"
+  apply_candidate "$candidate"
+  rm -f "$candidate"
+}
+
+# 按连接类型还原部署时的默认出站
+default_outbound_for_type() {
+  case $1 in
+    vless-ws-cloudflare-tunnel*) printf 'direct' ;;
+    *-v4) printf 'direct-v4' ;;
+    *-v6) printf 'direct-v6' ;;
+    *)    printf 'direct-dual' ;;
+  esac
+}
+
+# 某节点当前绑定的出站 (无规则时显示 direct)
+node_current_outbound() {
+  local out
+  out=$(jq -r --arg t "$1" '[.route.rules[]? | select((.inbound // []) | index($t)) | .outbound][0] // "direct"' "$CONFIG_FILE" 2>/dev/null || true)
+  printf '%s' "${out:-direct}"
+}
+
+warp_egress_ip() {
+  curl -fsS -m 8 -x "socks5h://127.0.0.1:${WARP_SOCKS_PORT}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -n1
+}
+
+warp_outbound_present() {
+  jq -e --arg tag "$WARP_OUTBOUND_TAG" '.outbounds[]? | select(.tag==$tag)' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+warp_assign_node() {
+  ensure_installed
+  local tag type cur proto has_udp=0 ip
+  warp_outbound_present || die "尚未配置 WARP 出站, 请先在 WARP 菜单选择「安装并连接」。"
+  if ! warp_is_connected; then
+    warn "WARP 当前未连接, 把节点切过去会导致该节点无法上网。"
+    confirm "仍要继续" N || return 0
+  fi
+  tag=$(pick_connection_tag) || return 0
+  type=$(_conn_field "$tag" type)
+  cur=$(node_current_outbound "$tag")
+  if [[ $cur == "$WARP_OUTBOUND_TAG" ]]; then ok "节点 [${tag}] 已经在走 WARP。"; return 0; fi
+  for proto in $(_proto_fw_protocols "$type"); do
+    if [[ $proto == udp ]]; then has_udp=1; fi
+  done
+  if (( has_udp )); then
+    warn "该节点含 UDP 流量 (如 Hysteria2/TUIC/SS 的 UDP 转发)。WARP 代理模式 (SOCKS5) 只可靠转发 TCP, UDP 部分切过去后可能不可用。"
+    confirm "仍要让 [${tag}] 走 WARP" N || return 0
+  fi
+  route_set_outbound "$tag" "$WARP_OUTBOUND_TAG"
+  ok "节点 [${tag}] 的出站已由 ${cur} 改为 ${WARP_OUTBOUND_TAG}。"
+  ip=$(warp_egress_ip || true)
+  if [[ -n $ip ]]; then info "WARP 出口 IP: ${ip} (客户端连上该节点后, 网站看到的就是这个 IP; 客户端连接地址不变)。"; fi
+  info "验证: 客户端连上该节点后访问 https://www.cloudflare.com/cdn-cgi/trace , 应显示 warp=on。"
+}
+
+warp_restore_node() {
+  ensure_installed
+  local tag type cur back
+  tag=$(pick_connection_tag) || return 0
+  type=$(_conn_field "$tag" type)
+  cur=$(node_current_outbound "$tag")
+  if [[ $cur != "$WARP_OUTBOUND_TAG" ]]; then ok "节点 [${tag}] 当前出站是 ${cur}, 无需恢复。"; return 0; fi
+  back=$(default_outbound_for_type "$type")
+  route_set_outbound "$tag" "$back"
+  ok "节点 [${tag}] 的出站已恢复为 ${back}。"
 }
 
 # 测试 / 以 source 方式引用时设置 SB_SOURCE_ONLY=1 只加载函数而不执行 main
