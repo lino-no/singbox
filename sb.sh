@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
+# sing-box-vps :: singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
 # Repository : https://github.com/lino-no/singbox
 #
 # 功能总览:
@@ -2850,19 +2850,24 @@ naming_city() {
   return 0
 }
 
-# 给名称加标识 (幂等: 已在目标位置带标识则原样返回; 标识在另一端则挪到目标位置)。
-# 名称可以是明文或 URL 编码, 标识本身是纯 ASCII
+# 给名称加标识 (幂等: 已在目标位置带同样标识则原样返回; 标识在另一端则挪到目标位置;
+# 标识已在目标位置但大小写不同, 则改成当前标识的大小写)。名称可以是明文或 URL 编码, 标识本身是纯 ASCII
 naming_add_tag() {
-  local name=$1 tag=$2 pos=$3 s=$1
+  local name=$1 tag=$2 pos=$3 s=$1 head tail
   local lname=${name,,} ltag=${tag,,} n=${#tag}
-  if [[ $lname == "$ltag" ]]; then printf '%s' "$name"; return 0; fi
+  if [[ $lname == "$ltag" ]]; then printf '%s' "$tag"; return 0; fi
   if [[ $pos == suffix ]]; then
-    # 已是后缀 (含重名时追加的 -端口 尾巴) 就不动
-    if [[ $lname == *-"$ltag" || $lname =~ -"$ltag"-[0-9]+$ ]]; then printf '%s' "$name"; return 0; fi
+    if [[ $lname == *-"$ltag" ]]; then
+      printf '%s-%s' "${name:0:$((${#name}-n-1))}" "$tag"; return 0
+    fi
+    if [[ $lname =~ -"$ltag"-[0-9]+$ ]]; then          # 重名时追加了 -端口 的尾巴
+      tail=${name##*-}; head=${name%-*}
+      printf '%s-%s-%s' "${head:0:$((${#head}-n-1))}" "$tag" "$tail"; return 0
+    fi
     if [[ $lname == "$ltag"-* ]]; then s=${name:$((n+1))}; fi
     printf '%s-%s' "$s" "$tag"
   else
-    if [[ $lname == "$ltag"-* ]]; then printf '%s' "$name"; return 0; fi
+    if [[ $lname == "$ltag"-* ]]; then printf '%s-%s' "$tag" "${name:$((n+1))}"; return 0; fi
     if [[ $lname == *-"$ltag" ]]; then s=${name:0:$((${#name}-n-1))}; fi
     printf '%s-%s' "$tag" "$s"
   fi
