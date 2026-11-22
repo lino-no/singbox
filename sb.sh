@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# sing-box-vps :: singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
+# sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
 # Repository : https://github.com/lino-no/singbox
 #
 # 功能总览:
@@ -4110,18 +4110,175 @@ ui_exec_row() {
 # ---------------------------------------------------------------------------
 # 渲染
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 主菜单健康摘要 (只读: 不改任何配置)。结果缓存 15 秒, 每次执行完菜单动作后清缓存,
+# 避免每次重绘都去调 warp-cli / openssl。
+#   缓存文件 6 行: 时间戳 / WARP 状态 / 走 WARP 的节点数 / 直连节点数 / 证书最少剩余天数 / 订阅服务
+# ---------------------------------------------------------------------------
+readonly UI_HEALTH_CACHE="${STATE_DIR}/ui_health"
+UI_H_WARP=none        # none = 未配置 warp-out; up / down
+UI_H_WARPN=0; UI_H_DIRECTN=0; UI_H_CERT=""; UI_H_SUB=0
+UI_B_TXT=""; UI_B_COL=""
+
+ui_health_collect() {
+  local now t="" w="" wn="" dn="" cd="" sb="" p end e d min=""
+  now=$(date +%s)
+  UI_H_WARP=none; UI_H_WARPN=0; UI_H_DIRECTN=0; UI_H_CERT=""; UI_H_SUB=0
+  if [[ -r $UI_HEALTH_CACHE ]]; then
+    { read -r t; read -r w; read -r wn; read -r dn; read -r cd; read -r sb; } <"$UI_HEALTH_CACHE" || true
+    if [[ $t =~ ^[0-9]+$ ]] && (( now - t < 15 )) && [[ $w == none || $w == up || $w == down ]] \
+       && [[ $wn =~ ^[0-9]+$ && $dn =~ ^[0-9]+$ && $sb =~ ^[01]$ ]]; then
+      UI_H_WARP=$w; UI_H_WARPN=$wn; UI_H_DIRECTN=$dn; UI_H_SUB=$sb
+      if [[ $cd =~ ^-?[0-9]+$ ]]; then UI_H_CERT=$cd; fi
+      return 0
+    fi
+  fi
+  if [[ -r $CONFIG_FILE ]]; then
+    wn=0; dn=0
+    IFS=' ' read -r wn dn < <(jq -r '[.route.rules[]? | select((.inbound|type)=="array" and (.inbound|length)==1 and .outbound != null) | .outbound] | "\(map(select(. == "warp-out")) | length) \(map(select(. != "warp-out")) | length)"' "$CONFIG_FILE" 2>/dev/null || true) || true
+    [[ $wn =~ ^[0-9]+$ ]] || wn=0
+    [[ $dn =~ ^[0-9]+$ ]] || dn=0
+    UI_H_WARPN=$wn; UI_H_DIRECTN=$dn
+    if jq -e '.outbounds[]? | select(.tag == "warp-out")' "$CONFIG_FILE" >/dev/null 2>&1; then
+      UI_H_WARP=down
+      if command -v warp-cli >/dev/null 2>&1 \
+         && timeout 3 warp-cli --accept-tos status 2>/dev/null | grep -qE 'Status update:[[:space:]]*Connected'; then
+        UI_H_WARP=up
+      fi
+    fi
+    while IFS= read -r p; do
+      [[ -n $p && -r $p ]] || continue
+      end=$(openssl x509 -enddate -noout -in "$p" 2>/dev/null | cut -d= -f2- || true)
+      [[ -n $end ]] || continue
+      e=$(date -d "$end" +%s 2>/dev/null || true)
+      [[ $e =~ ^[0-9]+$ ]] || continue
+      d=$(( (e - now) / 86400 ))
+      if [[ -z $min ]] || (( d < min )); then min=$d; fi
+    done < <(jq -r '.inbounds[]? | .tls.certificate_path? // empty' "$CONFIG_FILE" 2>/dev/null | sort -u || true)
+    UI_H_CERT=$min
+  fi
+  if systemctl is-active --quiet sing-box-vps-sub.service 2>/dev/null; then UI_H_SUB=1; fi
+  t=$(mktemp 2>/dev/null) || return 0
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$now" "$UI_H_WARP" "$UI_H_WARPN" "$UI_H_DIRECTN" "${UI_H_CERT:-x}" "$UI_H_SUB" >"$t" 2>/dev/null || true
+  mv -f "$t" "$UI_HEALTH_CACHE" 2>/dev/null || rm -f "$t"
+  return 0
+}
+
+# 证书剩余天数对应的颜色: <=7 红, <=30 黄, 其余绿
+ui_cert_color() {
+  if (( $1 <= 7 )); then printf '%s' "$RED"; elif (( $1 <= 30 )); then printf '%s' "$YELLOW"; else printf '%s' "$GREEN"; fi
+}
+
+# 顶部摘要行: 出口分布 / WARP / 证书 / 脚本版本。宽度不够时从后往前丢, 保证不换行
+ui_summary_line() {
+  local cols=$1 sep plain="" color="" ptxt ctxt cc
+  local -a pt=() ct=()
+  (( UI_ST_INST )) || return 0
+  if (( UI_H_WARPN + UI_H_DIRECTN > 0 )); then
+    pt+=("出口 直连 ${UI_H_DIRECTN} / WARP ${UI_H_WARPN}")
+    ct+=("${DIM}出口${NC} 直连 ${BOLD}${UI_H_DIRECTN}${NC} / WARP ${BOLD}${UI_H_WARPN}${NC}")
+  fi
+  case $UI_H_WARP in
+    up)   pt+=("WARP ${G_DOT} 已连接"); ct+=("${DIM}WARP${NC} ${GREEN}${G_DOT}${NC} 已连接") ;;
+    down) pt+=("WARP ${G_X} 未连接");   ct+=("${DIM}WARP${NC} ${RED}${G_X} 未连接${NC}") ;;
+  esac
+  if [[ -n $UI_H_CERT ]]; then
+    cc=$(ui_cert_color "$UI_H_CERT")
+    if (( UI_H_CERT < 0 )); then ptxt="证书已过期"; ctxt="${DIM}证书${NC} ${cc}已过期${NC}"
+    else ptxt="证书 ${UI_H_CERT} 天"; ctxt="${DIM}证书${NC} ${cc}${UI_H_CERT} 天${NC}"; fi
+    pt+=("$ptxt"); ct+=("$ctxt")
+  fi
+  pt+=("脚本 v${SCRIPT_VERSION}"); ct+=("${DIM}脚本${NC} v${SCRIPT_VERSION}")
+  if (( UI_UTF8 )); then sep="·"; else sep="|"; fi
+  local i
+  for i in "${!pt[@]}"; do
+    if [[ -z $plain ]]; then
+      ui_wv " ${pt[$i]}"
+      if (( UI_WV > cols - 1 )); then break; fi
+      plain=" ${pt[$i]}"; color=" ${ct[$i]}"
+    else
+      ui_wv "${plain}  ${sep}  ${pt[$i]}"
+      if (( UI_WV > cols - 1 )); then break; fi
+      plain+="  ${sep}  ${pt[$i]}"; color+="  ${DIM}${sep}${NC}  ${ct[$i]}"
+    fi
+  done
+  if [[ -n $color ]]; then printf '%s\n' "$color"; fi
+  return 0
+}
+
+# 告警条: 只在有问题时出现, 写清影响并指出去哪个菜单处理
+ui_alert() {
+  local cols=$1 col=$2 msg=$3 hint=$4
+  printf '%s%s%s %s\n' "$col" "$G_WARN" "$NC" "$(ui_trunc "$msg" $(( cols - 3 )))"
+  printf '  %s%s %s%s\n' "$DIM" "$G_ARR" "$(ui_trunc "$hint" $(( cols - 5 )))" "$NC"
+}
+
+ui_alert_bars() {
+  local cols=$1
+  if (( UI_ST_INST && UI_ST_NODES > 0 && ! UI_ST_RUN )); then
+    ui_alert "$cols" "$RED" "sing-box 未运行, ${UI_ST_NODES} 个节点现在不可用" "菜单 5 › 日志 查看原因; 菜单 6 › 安装 / 修复 sing-box 环境"
+  fi
+  if [[ $UI_H_WARP == down ]] && (( UI_H_WARPN > 0 )); then
+    ui_alert "$cols" "$YELLOW" "WARP 未连接, 但有 ${UI_H_WARPN} 个节点出口为 WARP, 这些节点现在不通" "菜单 4 › WARP 重连; 连不上多半是 VPS 面板防火墙没放行 UDP"
+  fi
+  if [[ -n $UI_H_CERT ]] && (( UI_H_CERT <= 14 )); then
+    if (( UI_H_CERT < 0 )); then
+      ui_alert "$cols" "$RED" "TLS 证书已过期, 使用证书的节点可能连不上" "菜单 6 › 证书管理 › 立即续期"
+    else
+      ui_alert "$cols" "$YELLOW" "TLS 证书 ${UI_H_CERT} 天后到期" "菜单 6 › 证书管理 › 立即续期 / 检查自动续期"
+    fi
+  fi
+  return 0
+}
+
+# 主菜单项右侧的状态徽标: 设置 UI_B_TXT / UI_B_COL (无则为空)
+ui_badge() {
+  UI_B_TXT=""; UI_B_COL=""
+  case $1 in
+    2) if (( UI_ST_NODES > 0 )); then
+         if (( UI_ST_RUN )); then UI_B_TXT="${G_DOT} ${UI_ST_NODES} 个"; UI_B_COL=$GREEN
+         else UI_B_TXT="${G_X} 未运行"; UI_B_COL=$RED; fi
+       fi ;;
+    3) if (( UI_H_SUB )); then UI_B_TXT="${G_DOT} 服务中"; UI_B_COL=$GREEN; fi ;;
+    4) case $UI_H_WARP in
+         up)   UI_B_TXT="${G_DOT} WARP 已连接"; UI_B_COL=$GREEN ;;
+         down) UI_B_TXT="${G_X} WARP 未连接";   UI_B_COL=$RED ;;
+       esac ;;
+    6) if [[ -n $UI_H_CERT ]]; then
+         UI_B_COL=$(ui_cert_color "$UI_H_CERT")
+         if (( UI_H_CERT < 0 )); then UI_B_TXT="${G_X} 证书过期"; else UI_B_TXT="证书 ${UI_H_CERT} 天"; fi
+       fi ;;
+  esac
+  return 0
+}
+
 ui_main_draw() {
-  local skip=${1:-0} cols row kind grp num sect title desc func cli flags
+  local skip=${1:-0} cols row kind grp num sect title desc func cli flags dw bw
   cols=$(ui_cols)
   printf '\n'
   if (( skip == 0 )); then ui_status_line; fi   # 首屏启动画面已含状态, 不重复
+  ui_health_collect
+  ui_summary_line "$cols"
   ui_hr
+  ui_alert_bars "$cols"
   for row in "${SB_MENU[@]}"; do
     IFS='|' read -r kind grp num sect title desc func cli flags <<<"$row"
     [[ $kind == G ]] || continue
+    ui_badge "$num"
     printf ' %s%2s%s  %s%s%s' "$CYAN" "$num" "$NC" "$BOLD" "$(ui_pad "$title" 12)" "$NC"
-    if (( cols >= 60 )); then printf '%s%s%s' "$DIM" "$desc" "$NC"; fi
-    printf ' %s%s%s\n' "$DIM" "$G_ARR" "$NC"
+    if (( cols >= 60 )); then
+      printf '%s%s%s' "$DIM" "$desc" "$NC"
+      printf ' %s%s%s' "$DIM" "$G_ARR" "$NC"
+      if [[ -n $UI_B_TXT ]]; then
+        ui_wv "$desc"; dw=$UI_WV; ui_wv "$UI_B_TXT"; bw=$UI_WV
+        if (( 19 + dw + 2 + bw <= cols - 1 )); then printf '  %s%s%s' "$UI_B_COL" "$UI_B_TXT" "$NC"; fi
+      fi
+      printf '\n'
+    else
+      # 窄屏: 说明文字收起, 只留状态徽标
+      if [[ -n $UI_B_TXT ]]; then printf ' %s%s%s' "$UI_B_COL" "$UI_B_TXT" "$NC"; fi
+      printf ' %s%s%s\n' "$DIM" "$G_ARR" "$NC"
+    fi
   done
   printf ' %s 0  退出%s\n' "$DIM" "$NC"
   return 0
@@ -4201,6 +4358,7 @@ menu() {
     if [[ $choice == 0 ]]; then exit 0; fi
     if ui_find_group "$choice"; then
       ui_exec_row "$R_FUNC" "$R_FLAGS"
+      rm -f "$UI_HEALTH_CACHE" 2>/dev/null || true     # 动作可能改了 WARP / 证书 / 节点, 下次重绘重新取状态
     else
       warn "无效选择: ${choice}"
     fi
