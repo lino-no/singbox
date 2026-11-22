@@ -997,6 +997,7 @@ generate_reality_keypair() {
 # 询问节点显示名称, 返回 URL 编码后的结果 (可直接拼进 URI 的 # 后面)
 ask_node_name() {
   local default=$1 name
+  default=$(naming_apply_default "$default")   # 已设置服务器标识时, 默认名称自动带上标识
   while true; do
     read -e -r -i "$default" -p "节点名称: " name || die "输入已取消。"
     name=${name:-$default}
@@ -2774,6 +2775,287 @@ pick_connection_tag() {
   printf '%s' "${tags[$((idx-1))]}"
 }
 
+# ===========================================================================
+# 服务器标识与节点命名 (只改显示名称: 不动 UUID/密码/密钥/端口/tag, 不影响服务与路由)
+#   标识文件: STATE_DIR/server_tag   选项文件: STATE_DIR/naming.conf (pos=prefix|suffix, city=0|1)
+#   节点显示名 = 连接串 # 之后的片段; 格式 "<国旗>%20<名称>", 标识加在国旗之后
+# ===========================================================================
+readonly NAMING_TAG_FILE="${STATE_DIR}/server_tag"
+readonly NAMING_CONF_FILE="${STATE_DIR}/naming.conf"
+NAMING_POS=prefix
+NAMING_CITY=0
+
+naming_valid_tag() {
+  [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,22}[A-Za-z0-9])?$ ]]
+}
+
+naming_load() {
+  NAMING_POS=prefix; NAMING_CITY=0
+  local k v
+  if [[ -r $NAMING_CONF_FILE ]]; then
+    while IFS='=' read -r k v; do
+      if [[ $k == pos && $v == suffix ]]; then NAMING_POS=suffix; fi
+      if [[ $k == city && $v == 1 ]]; then NAMING_CITY=1; fi
+    done <"$NAMING_CONF_FILE" || true
+  fi
+  return 0
+}
+
+naming_save_conf() {
+  local tmp; tmp=$(mktemp)
+  printf 'pos=%s\ncity=%s\n' "$NAMING_POS" "$NAMING_CITY" >"$tmp"
+  atomic_install "$tmp" "$NAMING_CONF_FILE" 600
+  rm -f "$tmp"
+}
+
+# 当前标识 (已校验并转大写); 未设置或非法时输出空
+naming_get_tag() {
+  local t=""
+  if [[ -r $NAMING_TAG_FILE ]]; then
+    t=$(head -n1 "$NAMING_TAG_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+  fi
+  if [[ -n $t ]] && naming_valid_tag "$t"; then printf '%s' "${t^^}"; fi
+  return 0
+}
+
+# 建议标识: x86 读 /proc/cpuinfo 厂商 (AMD1 / INTEL1), ARM 直接 ARM, 其它用架构名
+naming_suggest_tag() {
+  local arch vendor base
+  arch=$(uname -m 2>/dev/null || printf 'unknown')
+  case $arch in
+    x86_64|amd64|i?86)
+      vendor=$(awk -F': *' '/^vendor_id/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+      case $vendor in
+        AuthenticAMD) base=AMD1 ;;
+        GenuineIntel) base=INTEL1 ;;
+        *)            base=${arch^^}; base=${base//_/-} ;;
+      esac ;;
+    aarch64|arm64|armv*) base=ARM ;;
+    *) base=${arch^^}; base=${base//[^A-Z0-9]/-} ;;
+  esac
+  if ! naming_valid_tag "$base"; then base=VPS; fi
+  printf '%s' "$base"
+}
+
+# 城市 (可选功能, 结果不一定准确: 云厂商 IP 登记的城市常是总部/邻近城市)。只保留字母, 失败输出空
+naming_city() {
+  local c="" url
+  for url in "https://ipapi.co/city/" "https://ipinfo.io/city"; do
+    c=$(curl -4fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null | head -c 64 | tr -d '\r\n' || true)
+    if [[ $c =~ ^[A-Za-z][A-Za-z\ .\'-]{1,39}$ ]]; then
+      c=${c//[^A-Za-z]/}
+      if [[ -n $c ]]; then printf '%s' "$c"; return 0; fi
+    fi
+  done
+  return 0
+}
+
+# 给名称加标识 (幂等: 已在目标位置带标识则原样返回; 标识在另一端则挪到目标位置)。
+# 名称可以是明文或 URL 编码, 标识本身是纯 ASCII
+naming_add_tag() {
+  local name=$1 tag=$2 pos=$3 s=$1
+  local lname=${name,,} ltag=${tag,,} n=${#tag}
+  if [[ $lname == "$ltag" ]]; then printf '%s' "$name"; return 0; fi
+  if [[ $pos == suffix ]]; then
+    # 已是后缀 (含重名时追加的 -端口 尾巴) 就不动
+    if [[ $lname == *-"$ltag" || $lname =~ -"$ltag"-[0-9]+$ ]]; then printf '%s' "$name"; return 0; fi
+    if [[ $lname == "$ltag"-* ]]; then s=${name:$((n+1))}; fi
+    printf '%s-%s' "$s" "$tag"
+  else
+    if [[ $lname == "$ltag"-* ]]; then printf '%s' "$name"; return 0; fi
+    if [[ $lname == *-"$ltag" ]]; then s=${name:0:$((${#name}-n-1))}; fi
+    printf '%s-%s' "$tag" "$s"
+  fi
+}
+
+# 新建节点时的默认名称: 已设置标识就自动带上
+naming_apply_default() {
+  local name=$1 tag
+  tag=$(naming_get_tag)
+  if [[ -z $tag ]]; then printf '%s' "$name"; return 0; fi
+  naming_load
+  naming_add_tag "$name" "$tag" "$NAMING_POS"
+}
+
+# 改写一条连接串的显示名: 国旗保留在最前, 标识加在国旗之后
+naming_rewrite_uri() {
+  local uri=$1 tag=$2 pos=$3 base frag flag="" rest
+  if [[ $uri != *'#'* ]]; then printf '%s' "$uri"; return 0; fi
+  base=${uri%%#*}; frag=${uri#*#}
+  rest=$frag
+  if [[ $frag == *%20* ]]; then
+    flag=${frag%%%20*}
+    if [[ $flag != *[[:alnum:]]* || $flag =~ ^(%[0-9A-Fa-f]{2})+$ ]]; then
+      rest=${frag#*%20}
+    else
+      flag=""
+    fi
+  fi
+  rest=$(naming_add_tag "$rest" "$tag" "$pos")
+  if [[ -n $flag ]]; then printf '%s#%s%%20%s' "$base" "$flag" "$rest"; else printf '%s#%s' "$base" "$rest"; fi
+}
+
+# 把 {tag: 新连接串} 映射一次性写入 connections.json (先备份); $1 = 映射 JSON, $2 = 备份文件路径
+naming_commit_map() {
+  local map=$1 backup=$2
+  cp -p "$STATE_FILE" "$backup"
+  chmod 600 "$backup"
+  atomic_json_update "$STATE_FILE" \
+    '.connections |= map(if $m[.tag] then .uri = $m[.tag] else . end)' --argjson m "$map" || return 1
+  if find "$SUB_DIR" -maxdepth 1 -type f 2>/dev/null | grep -q .; then
+    sub_build_all >/dev/null 2>&1 && info "订阅文件已刷新。" || warn "订阅刷新失败, 可稍后在「订阅与分发」里重新生成。"
+  fi
+  return 0
+}
+
+naming_set_tag() {
+  ensure_dirs; naming_load
+  local cur sug city input tmp
+  cur=$(naming_get_tag)
+  sug=$(naming_suggest_tag)
+  if (( NAMING_CITY )); then
+    info "正在查询城市 (结果仅供参考, 可手改)…"
+    city=$(naming_city)
+    if [[ -n $city ]]; then sug="${sug}-${city}"; else warn "未能取得城市, 仅使用架构标识。"; fi
+  fi
+  if [[ -n $cur ]]; then sug=$cur; fi
+  info "标识只允许字母、数字和 -, 最长 24 位, 小写会自动转成大写; 全部清空表示清除标识。"
+  while true; do
+    read -e -r -i "$sug" -p "服务器标识: " input || die "输入已取消。"
+    input=${input//[[:space:]]/}
+    if [[ -z $input ]]; then
+      if confirm "清除服务器标识 (新节点不再自动带标识)" N; then
+        rm -f "$NAMING_TAG_FILE"; ok "标识已清除。"; return 0
+      fi
+      continue
+    fi
+    if naming_valid_tag "$input"; then break; fi
+    warn "格式不对: 只能用字母、数字和 -, 首尾不能是 -, 最长 24 位。"
+  done
+  input=${input^^}
+  tmp=$(mktemp); printf '%s\n' "$input" >"$tmp"
+  atomic_install "$tmp" "$NAMING_TAG_FILE" 600; rm -f "$tmp"
+  ok "服务器标识已设为 ${input}, 之后新建的节点会自动带上。"
+  if confirm "现在给已有节点批量加上标识" N; then naming_batch_apply; fi
+  return 0
+}
+
+naming_batch_apply() {
+  ensure_dirs; naming_load
+  local tag t p u nu n i changed=0 same=0 map backup key
+  local -a tags=() ports=() olds=() news=()
+  local -A cnt=()
+  tag=$(naming_get_tag)
+  if [[ -z $tag ]]; then warn "请先设置服务器标识。"; return 0; fi
+  while IFS=$'\t' read -r t p u; do
+    [[ -n $t ]] || continue
+    tags+=("$t"); ports+=("$p"); olds+=("$u")
+    news+=("$(naming_rewrite_uri "$u" "$tag" "$NAMING_POS")")
+  done < <(jq -r '.connections[]? | [.tag, (.port|tostring), .uri] | @tsv' "$STATE_FILE")
+  if (( ${#tags[@]} == 0 )); then warn "尚无节点记录。"; return 0; fi
+
+  # 改完会同名的节点: 自动追加端口, 避免 Clash 订阅里名称冲突
+  for i in "${!tags[@]}"; do
+    n=$(ui_uri_name "${news[$i]}"); [[ -n $n ]] || n=_
+    cnt["$n"]=$(( ${cnt["$n"]:-0} + 1 ))
+  done
+  for i in "${!tags[@]}"; do
+    if [[ ${news[$i]} != "${olds[$i]}" ]]; then
+      n=$(ui_uri_name "${news[$i]}"); [[ -n $n ]] || n=_
+      if (( ${cnt["$n"]} > 1 )); then news[$i]="${news[$i]}-${ports[$i]}"; fi
+    fi
+  done
+
+  title "批量加标识预览 (标识 ${tag}, $([[ $NAMING_POS == suffix ]] && printf 后缀 || printf 前缀))"
+  for i in "${!tags[@]}"; do
+    if [[ ${news[$i]} == "${olds[$i]}" ]]; then same=$((same+1)); continue; fi
+    changed=$((changed+1))
+    printf ' %s%s%s\n   %s  %s\n   %s▸%s  %s\n' "$CYAN" "${tags[$i]}" "$NC" "$G_DOT" "$(ui_uri_name "${olds[$i]}")" "$GREEN" "$NC" "$(ui_uri_name "${news[$i]}")"
+  done
+  if (( changed == 0 )); then info "所有节点名称都已带有标识, 无需改动。"; return 0; fi
+  info "将修改 ${changed} 个节点名称, ${same} 个已带标识保持不变。只改显示名, 不影响服务。"
+  if ! confirm "确认改名" Y; then info "已取消。"; return 0; fi
+
+  map='{}'
+  for i in "${!tags[@]}"; do
+    if [[ ${news[$i]} != "${olds[$i]}" ]]; then
+      map=$(jq -c --arg t "${tags[$i]}" --arg u "${news[$i]}" '.[$t] = $u' <<<"$map")
+    fi
+  done
+  backup="${BACKUP_DIR}/connections.names.$(date +%Y%m%d-%H%M%S)-$$.json"
+  naming_commit_map "$map" "$backup" || die "写入连接记录失败, 原文件未改动。"
+  ok "已改名 ${changed} 个节点, 备份: ${backup}"
+  info "请在客户端刷新订阅 / 重新导入。可用「恢复上次改名」撤销。"
+  return 0
+}
+
+naming_restore() {
+  ensure_dirs
+  local bak t u cur map='{}' n=0 backup
+  bak=$(ls -1t "${BACKUP_DIR}"/connections.names.*.json 2>/dev/null | head -n1 || true)
+  if [[ -z $bak ]]; then warn "没有可恢复的改名备份。"; return 0; fi
+  info "最近一次备份: ${bak}"
+  # 只还原名称 (# 之后), 备份之后改过的端口 / 地址等保持不变; 备份里没有的新节点不动
+  while IFS=$'\t' read -r t u; do
+    [[ -n $t && $u == *'#'* ]] || continue
+    cur=$(jq -r --arg t "$t" '.connections[]? | select(.tag==$t) | .uri' "$STATE_FILE" | head -n1)
+    [[ -n $cur && $cur == *'#'* ]] || continue
+    if [[ ${cur#*#} != "${u#*#}" ]]; then
+      map=$(jq -c --arg t "$t" --arg u "${cur%%#*}#${u#*#}" '.[$t] = $u' <<<"$map")
+      n=$((n+1))
+    fi
+  done < <(jq -r '.connections[]? | [.tag, .uri] | @tsv' "$bak")
+  if (( n == 0 )); then info "名称与备份一致, 无需恢复。"; return 0; fi
+  info "将把 ${n} 个节点的名称恢复为备份时的样子。"
+  if ! confirm "确认恢复" Y; then info "已取消。"; return 0; fi
+  backup="${BACKUP_DIR}/connections.names.$(date +%Y%m%d-%H%M%S)-$$.json"
+  naming_commit_map "$map" "$backup" || die "写入连接记录失败, 原文件未改动。"
+  mv -f "$bak" "${bak%.json}.restored" 2>/dev/null || true
+  ok "已恢复 ${n} 个节点名称 (恢复前的状态另存为 ${backup})。"
+  return 0
+}
+
+naming_options() {
+  ensure_dirs; naming_load
+  local choice
+  ui_choices "命名选项" "" \
+    "1|标识位置|当前: $([[ $NAMING_POS == suffix ]] && printf '后缀 (🇺🇸 Reality-AMD1)' || printf '前缀 (🇺🇸 AMD1-Reality)'), 选 1 切换|" \
+    "2|带城市|当前: $([[ $NAMING_CITY == 1 ]] && printf '开' || printf '关'); 开启后设置标识时自动填入城市建议值|"
+  read -e -r -p "选择: " choice || die "输入已取消。"
+  case ${choice//[[:space:]]/} in
+    1) if [[ $NAMING_POS == suffix ]]; then NAMING_POS=prefix; else NAMING_POS=suffix; fi
+       naming_save_conf; ok "标识位置已设为: $([[ $NAMING_POS == suffix ]] && printf 后缀 || printf 前缀)" ;;
+    2) if (( NAMING_CITY )); then NAMING_CITY=0; else NAMING_CITY=1; fi
+       naming_save_conf; ok "城市: $([[ $NAMING_CITY == 1 ]] && printf 开 || printf 关)" ;;
+    *) ;;
+  esac
+  return 0
+}
+
+naming_menu() {
+  local choice rc cur
+  while true; do
+    naming_load
+    cur=$(naming_get_tag)
+    ui_choices "服务器标识与节点命名" "标识: ${cur:-未设置}  位置: $([[ $NAMING_POS == suffix ]] && printf 后缀 || printf 前缀)  城市: $([[ $NAMING_CITY == 1 ]] && printf 开 || printf 关)" \
+      "1|设置标识|按架构给出建议值 (AMD1 / ARM ...), 可手改|" \
+      "2|批量加标识|先预览, 确认后自动备份并刷新订阅|" \
+      "3|恢复上次改名|从最近一次备份还原节点名称|" \
+      "4|命名选项|前缀 / 后缀, 是否带城市|" \
+      "0|返回||"
+    rc=0; read -e -r -p "选择: " choice || rc=$?
+    if (( rc != 0 )); then printf '\n'; return 0; fi
+    case ${choice//[[:space:]]/} in
+      1) run_action "" naming_set_tag ;;
+      2) run_action "" naming_batch_apply ;;
+      3) run_action "" naming_restore ;;
+      4) run_action "" naming_options ;;
+      0|"") return 0 ;;
+      *) warn "无效选择: ${choice}" ;;
+    esac
+  done
+}
+
 rename_node() {
   ensure_dirs
   local tag new_enc old_uri new_uri
@@ -3650,6 +3932,7 @@ readonly -a SB_MENU=(
   "I|6|6||更新本脚本|从 GitHub 拉取|update_manager|self-update|"
   "I|6|7||卸载 sing-box|保留配置与数据|uninstall_sing_box|uninstall|"
   "I|6|8||彻底清除|软件包+配置+证书+防火墙, 不可逆|purge_all|purge|"
+  "I|6|9||服务器标识与节点命名|AMD1 / ARM 标识, 批量改名|naming_menu|naming|M"
   "I|0|-||部署 VLESS Reality (双栈)||deploy_vless_reality_unified dual|reality-dual|"
   "I|0|-||部署 VLESS Reality (仅 IPv4)||deploy_vless_reality_unified v4|reality-v4|"
   "I|0|-||部署 VLESS Reality (仅 IPv6)||deploy_vless_reality_unified v6|reality-v6|"
