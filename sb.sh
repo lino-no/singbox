@@ -3515,6 +3515,38 @@ ui_copy() {
   return 0
 }
 
+# 批量复制连接串: sel = a / * (全部) 或 1,3 / 2-4 / 1,3-4 这样的编号列表; 多条按行拼接后一次性写入剪贴板
+ui_copy_many() {
+  local sel=${1,,} part a b i cnt=0 out=""
+  local -a parts=()
+  local -A pick=()
+  if [[ $sel == a || $sel == '*' ]]; then
+    for ((i=0; i<NL_N; i++)); do pick[$i]=1; done
+  else
+    IFS=',' read -ra parts <<<"$sel"
+    for part in "${parts[@]}"; do
+      if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+        if (( a > b )); then i=$a; a=$b; b=$i; fi
+      elif [[ $part =~ ^[0-9]+$ ]]; then
+        a=$((10#$part)); b=$a
+      else
+        warn "无法识别的编号 “${part}”, 格式如 ca / c1,3 / c2-4"; return 0
+      fi
+      if (( a < 1 || b > NL_N )); then warn "编号超出范围 (当前 1-${NL_N})。"; return 0; fi
+      for ((i=a; i<=b; i++)); do pick[$((i-1))]=1; done
+    done
+  fi
+  for ((i=0; i<NL_N; i++)); do
+    if [[ -n ${pick[$i]:-} ]]; then out+="${NL_URI[i]}"$'\n'; cnt=$((cnt+1)); fi
+  done
+  if (( cnt == 0 )); then warn "没有选中任何节点。"; return 0; fi
+  ui_copy "${out%$'\n'}"
+  info "共 ${cnt} 条链接 (每行一条)。"
+  if confirm "同时在屏幕上显示这 ${cnt} 条完整链接" N; then printf '%s' "$out"; fi
+  return 0
+}
+
 # 连接串过长时中间截断
 ui_show_uri() {
   local uri=$1 cols n
@@ -4392,7 +4424,7 @@ node_list_menu() {
       return 0
     fi
     ui_node_table
-    printf '\n%sq%s 二维码  %sc%s 复制链接  %se%s 编辑  %sd%s 删除  %sf%s 修复防火墙  %sl%s 日志  %sn%s 命名  %s0%s 返回\n' \
+    printf '\n%sq%s 二维码  %sc%s 复制链接 (ca=全部)  %se%s 编辑  %sd%s 删除  %sf%s 修复防火墙  %sl%s 日志  %sn%s 命名  %s0%s 返回\n' \
       "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC"
     rc=0; MENU_INT=0
     read -e -r -p "操作 (如 e3): " act || rc=$?
@@ -4400,6 +4432,9 @@ node_list_menu() {
     act=${act//[[:space:]]/}
     if [[ -z $act ]]; then continue; fi
     if [[ $act == 0 ]]; then return 0; fi
+    if [[ $act =~ ^[cC](a|A|\*|[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*)$ && ! $act =~ ^[cC][0-9]+$ ]]; then
+      ui_copy_many "${act:1}"; continue                              # 批量复制: ca / c1,3 / c2-4
+    fi
     if [[ $act == n || $act == N ]]; then naming_menu; continue; fi    # 服务器标识与批量命名
     if [[ $act =~ ^([qcedfl])([0-9]+)$ ]]; then
       verb=${BASH_REMATCH[1]}; num=$((10#${BASH_REMATCH[2]}))
