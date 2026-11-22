@@ -2808,13 +2808,13 @@ naming_save_conf() {
   rm -f "$tmp"
 }
 
-# 当前标识 (已校验并转大写); 未设置或非法时输出空
+# 当前标识 (已校验, 保持原有大小写); 未设置或非法时输出空
 naming_get_tag() {
   local t=""
   if [[ -r $NAMING_TAG_FILE ]]; then
     t=$(head -n1 "$NAMING_TAG_FILE" 2>/dev/null | tr -d '[:space:]' || true)
   fi
-  if [[ -n $t ]] && naming_valid_tag "$t"; then printf '%s' "${t^^}"; fi
+  if [[ -n $t ]] && naming_valid_tag "$t"; then printf '%s' "$t"; fi
   return 0
 }
 
@@ -2919,7 +2919,7 @@ naming_set_tag() {
     if [[ -n $city ]]; then sug="${sug}-${city}"; else warn "未能取得城市, 仅使用架构标识。"; fi
   fi
   if [[ -n $cur ]]; then sug=$cur; fi
-  info "标识只允许字母、数字和 -, 最长 24 位, 小写会自动转成大写; 全部清空表示清除标识。"
+  info "标识只允许字母、数字和 -, 最长 24 位, 区分大小写按你输入的保存; 全部清空表示清除标识。"
   while true; do
     read -e -r -i "$sug" -p "服务器标识: " input || die "输入已取消。"
     input=${input//[[:space:]]/}
@@ -2932,7 +2932,6 @@ naming_set_tag() {
     if naming_valid_tag "$input"; then break; fi
     warn "格式不对: 只能用字母、数字和 -, 首尾不能是 -, 最长 24 位。"
   done
-  input=${input^^}
   tmp=$(mktemp); printf '%s\n' "$input" >"$tmp"
   atomic_install "$tmp" "$NAMING_TAG_FILE" 600; rm -f "$tmp"
   ok "服务器标识已设为 ${input}, 之后新建的节点会自动带上。"
@@ -3932,7 +3931,8 @@ readonly -a SB_MENU=(
   "I|6|6||更新本脚本|从 GitHub 拉取|update_manager|self-update|"
   "I|6|7||卸载 sing-box|保留配置与数据|uninstall_sing_box|uninstall|"
   "I|6|8||彻底清除|软件包+配置+证书+防火墙, 不可逆|purge_all|purge|"
-  "I|6|9||服务器标识与节点命名|AMD1 / ARM 标识, 批量改名|naming_menu|naming|M"
+  # 命名功能的入口在「节点列表」里按 n; 这一行只为提供命令行 sb naming (grp 2 无子菜单, 不会显示)
+  "I|2|1||服务器标识与节点命名|AMD1 / ARM 标识, 批量改名|naming_menu|naming|M"
   "I|0|-||部署 VLESS Reality (双栈)||deploy_vless_reality_unified dual|reality-dual|"
   "I|0|-||部署 VLESS Reality (仅 IPv4)||deploy_vless_reality_unified v4|reality-v4|"
   "I|0|-||部署 VLESS Reality (仅 IPv6)||deploy_vless_reality_unified v6|reality-v6|"
@@ -4392,14 +4392,15 @@ node_list_menu() {
       return 0
     fi
     ui_node_table
-    printf '\n%sq%s 二维码  %sc%s 复制链接  %se%s 编辑  %sd%s 删除  %sf%s 修复防火墙  %sl%s 日志  %s0%s 返回\n' \
-      "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC"
+    printf '\n%sq%s 二维码  %sc%s 复制链接  %se%s 编辑  %sd%s 删除  %sf%s 修复防火墙  %sl%s 日志  %sn%s 命名  %s0%s 返回\n' \
+      "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC" "$CYAN" "$NC"
     rc=0; MENU_INT=0
     read -e -r -p "操作 (如 e3): " act || rc=$?
     if (( rc != 0 )); then printf '\n'; return 0; fi
     act=${act//[[:space:]]/}
     if [[ -z $act ]]; then continue; fi
     if [[ $act == 0 ]]; then return 0; fi
+    if [[ $act == n || $act == N ]]; then naming_menu; continue; fi    # 服务器标识与批量命名
     if [[ $act =~ ^([qcedfl])([0-9]+)$ ]]; then
       verb=${BASH_REMATCH[1]}; num=$((10#${BASH_REMATCH[2]}))
     else
