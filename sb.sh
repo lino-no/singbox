@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# sing-box-vps :: 小李的singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
+# sing-box-vps :: singbox VPS ai双栈智能管理脚本 0.1.0   (LINONO)
 # Repository : https://github.com/lino-no/singbox
 #
 # 功能总览:
